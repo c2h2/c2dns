@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -17,7 +18,7 @@ import (
 	"github.com/miekg/dns"
 )
 
-const EXPIRE_MULTIPLIER = 10
+var EXPIRE_MULTIPLIER int
 
 // Upstream represents an upstream DNS server.
 type Upstream struct {
@@ -64,12 +65,13 @@ var (
 // globalReqCount is a counter for all requests.
 var globalReqCount uint64
 
+// denyAAAA is set from the CLI flag; when true, AAAA answers will be removed if an A record exists.
+var denyAAAA bool
+
 // Enforce a minimum TTL so zero/low TTLs from upstream won't disable caching.
 const defaultMinTTL = 30
 
 // cacheKey builds a key for caching based on the first question.
-// We canonicalize by lowercasing and calling dns.Fqdn() so that
-// "Example.com" vs. "example.com." become consistent keys.
 func cacheKey(req *dns.Msg) string {
 	if len(req.Question) > 0 {
 		q := req.Question[0]
@@ -116,7 +118,7 @@ func getCachedResponse(key string) (*dns.Msg, bool) {
 	return response, true
 }
 
-// setCache stores the reply in the cache using the smallest TTL found in the message (Answer/Ns/Extra).
+// setCache stores the reply in the cache using the smallest TTL found in the message.
 func setCache(key string, msg *dns.Msg) {
 	var minTTL uint32 = 0xffffffff
 
@@ -146,7 +148,7 @@ func setCache(key string, msg *dns.Msg) {
 	}
 
 	now := time.Now()
-	expires := now.Add(time.Duration(minTTL) * time.Second * EXPIRE_MULTIPLIER)
+	expires := now.Add(time.Duration(minTTL) * time.Second * time.Duration(EXPIRE_MULTIPLIER))
 
 	cacheMutex.Lock()
 	cache[key] = cacheEntry{
@@ -157,12 +159,13 @@ func setCache(key string, msg *dns.Msg) {
 	}
 	cacheMutex.Unlock()
 
-	//log.Printf("Caching response for key=%s with minTTL=%d", key, minTTL)
-	//fileLogger.Printf("Caching response for key=%s with minTTL=%d", key, minTTL)
+	// Uncomment for debugging:
+	// log.Printf("Caching response for key=%s with minTTL=%d", key, minTTL)
+	// fileLogger.Printf("Caching response for key=%s with minTTL=%d", key, minTTL)
 }
 
 // queryUpstreams sends the DNS query concurrently to all upstream servers and returns the reply
-// from the fastest server—with a short extra wait if the first reply is IPv6 (to see if an IPv4 answer arrives).
+// from the fastest server—with a short extra wait if the first reply is IPv6.
 func queryUpstreams(req *dns.Msg) (*dns.Msg, string, error) {
 	respCh := make(chan upstreamResponse, len(upstreams))
 
@@ -275,7 +278,7 @@ func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start t
 
 	// Start building a single log line.
 	logLine := fmt.Sprintf("reqID=%d, remote=%s, domain=%s", reqID, remoteAddr, domain)
-	
+
 	key := cacheKey(req)
 	if cachedMsg, found := getCachedResponse(key); found {
 		// If served from cache
@@ -318,6 +321,47 @@ func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start t
 	return resp, fastest, nil
 }
 
+// filterAAAAIfAExists checks for an A record for the queried domain and,
+// if found, removes any AAAA records from the response.
+func filterAAAAIfAExists(resp *dns.Msg, req *dns.Msg, remoteAddr, proto string, reqID uint64, start time.Time) *dns.Msg {
+	// Only apply if the query is AAAA and the CLI flag is set.
+	if len(req.Question) == 0 || req.Question[0].Qtype != dns.TypeAAAA || !denyAAAA {
+		return resp
+	}
+
+	// Create a new A query for the same domain.
+	aReq := new(dns.Msg)
+	aReq.SetQuestion(req.Question[0].Name, dns.TypeA)
+	// Increment the global request counter for this additional lookup.
+	newReqID := atomic.AddUint64(&globalReqCount, 1)
+	aResp, _, err := resolveDNS(remoteAddr, proto, aReq, newReqID, start)
+	if err == nil && len(aResp.Answer) > 0 {
+		// Log that we are denying AAAA records because an A record exists.
+		logLine := fmt.Sprintf("reqID=%d, domain=%s: AAAA response denied because A record exists", reqID, req.Question[0].Name)
+		log.Println(logLine)
+		fileLogger.Println(logLine)
+
+		// Remove any AAAA records from the Answer section.
+		var filteredAnswers []dns.RR
+		for _, rr := range resp.Answer {
+			if rr.Header().Rrtype != dns.TypeAAAA {
+				filteredAnswers = append(filteredAnswers, rr)
+			}
+		}
+		resp.Answer = filteredAnswers
+
+		// Similarly, filter out AAAA records from the Extra section.
+		var filteredExtra []dns.RR
+		for _, rr := range resp.Extra {
+			if rr.Header().Rrtype != dns.TypeAAAA {
+				filteredExtra = append(filteredExtra, rr)
+			}
+		}
+		resp.Extra = filteredExtra
+	}
+	return resp
+}
+
 // handleDNSRequest is the handler for DNS queries (used by UDP/TCP servers).
 func handleDNSRequest(w dns.ResponseWriter, req *dns.Msg) {
 	start := time.Now()
@@ -343,11 +387,16 @@ func handleDNSRequest(w dns.ResponseWriter, req *dns.Msg) {
 		_ = w.WriteMsg(m)
 		return
 	}
+
+	// If this is a AAAA query and the denyAAAA flag is enabled, check for an A record.
+	if len(req.Question) > 0 && req.Question[0].Qtype == dns.TypeAAAA && denyAAAA {
+		resp = filterAAAAIfAExists(resp, req, remoteAddr, proto, reqID, start)
+	}
+
 	_ = w.WriteMsg(resp)
 }
 
 // dohHandler implements a simple DNS-over-HTTPS (DoH) endpoint.
-// It supports GET (with base64url-encoded "dns" parameter) and POST (raw DNS message).
 func dohHandler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	reqID := atomic.AddUint64(&globalReqCount, 1)
@@ -389,10 +438,16 @@ func dohHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	remoteAddr := r.RemoteAddr
-	resp, _, err := resolveDNS(remoteAddr, "http", &reqMsg, reqID, start)
+	proto := "http"
+	resp, _, err := resolveDNS(remoteAddr, proto, &reqMsg, reqID, start)
 	if err != nil {
 		http.Error(w, "DNS query failed", http.StatusInternalServerError)
 		return
+	}
+
+	// If this is a AAAA query and the denyAAAA flag is enabled, check for an A record.
+	if len(reqMsg.Question) > 0 && reqMsg.Question[0].Qtype == dns.TypeAAAA && denyAAAA {
+		resp = filterAAAAIfAExists(resp, &reqMsg, remoteAddr, proto, reqID, start)
 	}
 
 	// Pack the DNS response.
@@ -410,6 +465,13 @@ func dohHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	// Define the CLI flag.
+	denyAAAAFlag := flag.Bool("denyAAAA", true, "Deny IPv6 AAAA records if an A record for the domain exists")
+	expireMultiplierFlag := flag.Int("expireMultiplier", 10, "Multiplier for the cache expiration time")
+	flag.Parse()
+	denyAAAA = *denyAAAAFlag
+	EXPIRE_MULTIPLIER  = *expireMultiplierFlag
+
 	// Open (or create) a log file to record queries.
 	f, err := os.OpenFile("dns_queries.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
