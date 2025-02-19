@@ -33,6 +33,11 @@ var globalCacheHits uint64
 var globalDeniedAAAA uint64
 var globalChinaDomainsCount uint64
 var globalDefaultDomainsDNSCount uint64
+
+// globalRRCount records the number of records served by type (A, AAAA, MX, CNAME, etc.).
+var globalRRCount = make(map[string]uint64)
+var globalRRCountMutex sync.Mutex
+
 // persistentCacheEntry is the structure we use to save the cache to disk.
 type persistentCacheEntry struct {
 	Key         string `json:"key"`
@@ -115,7 +120,8 @@ const (
 	colorGreen  = "\033[32m"
 	colorBlue   = "\033[34m"
 	colorYellow = "\033[33m"
-	colorReset  = "\033[0m"
+	colorCyan   = "\033[36m"
+	colorReset  = "\033[0m"	
 )
 
 // cacheKey builds a key for caching based on the first question.
@@ -366,6 +372,24 @@ func loadChinaList(filename string) (map[string]bool, error) {
 	return m, nil
 }
 
+// recordRRCounts iterates through all sections of the DNS response and updates global counters per record type.
+func recordRRCounts(msg *dns.Msg) {
+	globalRRCountMutex.Lock()
+	defer globalRRCountMutex.Unlock()
+	for _, rr := range msg.Answer {
+		rtype := dns.TypeToString[rr.Header().Rrtype]
+		globalRRCount[rtype]++
+	}
+	for _, rr := range msg.Ns {
+		rtype := dns.TypeToString[rr.Header().Rrtype]
+		globalRRCount[rtype]++
+	}
+	for _, rr := range msg.Extra {
+		rtype := dns.TypeToString[rr.Header().Rrtype]
+		globalRRCount[rtype]++
+	}
+}
+
 // resolveDNS handles caching, upstream querying, and logging. It selects the upstream servers
 // based on whether the queried domain (or its parent) is in the China list.
 func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start time.Time) (*dns.Msg, string, error) {
@@ -502,6 +526,9 @@ func handleDNSRequest(w dns.ResponseWriter, req *dns.Msg) {
 		resp = filterAAAAIfAExists(resp, req, remoteAddr, proto, reqID, start)
 	}
 
+	// Record the DNS record counts from this response.
+	recordRRCounts(resp)
+
 	_ = w.WriteMsg(resp)
 }
 
@@ -555,6 +582,9 @@ func dohHandler(w http.ResponseWriter, r *http.Request) {
 	if len(reqMsg.Question) > 0 && reqMsg.Question[0].Qtype == dns.TypeAAAA && denyAAAA {
 		resp = filterAAAAIfAExists(resp, &reqMsg, remoteAddr, proto, reqID, start)
 	}
+
+	// Record the record counts for this response.
+	recordRRCounts(resp)
 
 	packed, err := resp.Pack()
 	if err != nil {
@@ -613,9 +643,19 @@ func printCacheStats() {
 
 		banner := fmt.Sprintf("==========Cache Stats | Uptime: %s==========", uptimeStr)
 		fmt.Println(banner)
-		fmt.Printf("%sTotal Cache Entries=%d, Valid=%d, Expired=%d, Failed=%d, DeniedAAAA=%d%s\n", colorGreen, total, valid, expired, failed, deniedAAAA, colorReset)
-		fmt.Printf("%sTotal DNS Requests=%d, ReqPerSec=%.2f, Cache Hit Rate=%.2f%%, Cache Miss Rate=%.2f%%%s\n", colorGreen, requests, requestsPerSecond, cacheHitRate, 100-cacheHitRate, colorReset)
+		fmt.Printf("%sTotal Cache Entries=%d, Valid=%d, Expired=%d, Failed=%d, DeniedAAAA=%d%s\n", colorCyan, total, valid, expired, failed, deniedAAAA, colorReset)
+		fmt.Printf("%sTotal DNS Requests=%d, ReqPerSec=%.2f, Cache Hit Rate=%.2f%%, Cache Miss Rate=%.2f%%%s\n", colorCyan, requests, requestsPerSecond, cacheHitRate, 100-cacheHitRate, colorReset)
 		fmt.Printf("%sRequest China Domains=%d, %sRequest Default Domains=%d%s\n", colorBlue, chinaDomainsCount, colorYellow, defaultDomainsCount, colorReset)
+
+		// Print the counts per record type.
+		globalRRCountMutex.Lock()
+		fmt.Printf("%sDNS Record Type Counts:", colorCyan)
+		for rtype, count := range globalRRCount {
+			fmt.Printf(" %s=%d", rtype, count)
+		}
+		fmt.Printf("%s\n", colorReset)
+		globalRRCountMutex.Unlock()
+
 		fmt.Println(strings.Repeat("=", len(banner)))
 	}
 }
