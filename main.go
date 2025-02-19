@@ -31,7 +31,8 @@ var globalReqCount uint64
 var globalFailedCount uint64
 var globalCacheHits uint64
 var globalDeniedAAAA uint64
-
+var globalChinaDomainsCount uint64
+var globalDefaultDomainsDNSCount uint64
 // persistentCacheEntry is the structure we use to save the cache to disk.
 type persistentCacheEntry struct {
 	Key         string `json:"key"`
@@ -397,10 +398,12 @@ func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start t
 		selectedUpstreams = upstreamsChina
 		logLine += ", upstream=china"
 		color = colorBlue
+		atomic.AddUint64(&globalChinaDomainsCount, 1)
 	} else {
 		selectedUpstreams = upstreamsDefault
 		logLine += ", upstream=default"
 		color = colorYellow
+		atomic.AddUint64(&globalDefaultDomainsDNSCount, 1)
 	}
 
 	// Use singleflight to collapse duplicate in-flight queries.
@@ -598,6 +601,9 @@ func printCacheStats() {
 		requests := atomic.LoadUint64(&globalReqCount)
 		requestsPerSecond := float64(requests) / uptime.Seconds()
 		cacheHits := atomic.LoadUint64(&globalCacheHits)
+		chinaDomainsCount := atomic.LoadUint64(&globalChinaDomainsCount)
+		defaultDomainsCount := atomic.LoadUint64(&globalDefaultDomainsDNSCount)
+
 		var cacheHitRate float64
 		if requests > 0 {
 			cacheHitRate = float64(cacheHits) / float64(requests) * 100
@@ -609,6 +615,7 @@ func printCacheStats() {
 		fmt.Println(banner)
 		fmt.Printf("%sTotal Cache Entries=%d, Valid=%d, Expired=%d, Failed=%d, DeniedAAAA=%d%s\n", colorGreen, total, valid, expired, failed, deniedAAAA, colorReset)
 		fmt.Printf("%sTotal DNS Requests=%d, ReqPerSec=%.2f, Cache Hit Rate=%.2f%%, Cache Miss Rate=%.2f%%%s\n", colorGreen, requests, requestsPerSecond, cacheHitRate, 100-cacheHitRate, colorReset)
+		fmt.Printf("%sRequest China Domains=%d, %sRequest Default Domains=%d%s\n", colorBlue, chinaDomainsCount, colorYellow, defaultDomainsCount, colorReset)
 		fmt.Println(strings.Repeat("=", len(banner)))
 	}
 }
