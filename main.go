@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/base64"
 	"errors"
 	"flag"
@@ -22,18 +23,21 @@ var EXPIRE_MULTIPLIER int
 
 // Upstream represents an upstream DNS server.
 type Upstream struct {
-	Address  string // For UDP/TCP, host:port (e.g. "8.8.8.8:53"). For HTTPS, the full URL (e.g. "https://1.1.1.1/dns-query")
+	Address  string // For UDP/TCP: host:port; For HTTPS: full URL (e.g. "https://1.1.1.1/dns-query")
 	IsIPv4   bool   // whether this upstream is IPv4
 	Protocol string // "udp", "tcp", or "https"
 }
 
-// Upstream servers to query (order doesn’t matter since we query concurrently).
-var upstreams = []Upstream{
+// upstreamsChina is used for domains in the China list.
+var upstreamsChina = []Upstream{
+	{Address: "223.5.5.5:53", IsIPv4: true, Protocol: "udp"},
+}
+
+// upstreamsDefault is used for other domains.
+var upstreamsDefault = []Upstream{
 	/*{Address: "8.8.8.8:53", IsIPv4: true, Protocol: "udp"},
-	{Address: "8.8.4.4:53", IsIPv4: true, Protocol: "udp"},
-	{Address: "[2001:4860:4860::8888]:53", IsIPv4: false, Protocol: "udp"},
-	{Address: "[2001:4860:4860::8844]:53", IsIPv4: false, Protocol: "udp"},*/
-	// DNS-over-HTTPS upstream (Cloudflare DoH endpoint)
+	{Address: "8.8.4.4:53", IsIPv4: true, Protocol: "udp"},*/
+	// DNS-over-HTTPS example:
 	{Address: "https://1.1.1.1/dns-query", IsIPv4: true, Protocol: "https"},
 }
 
@@ -58,15 +62,18 @@ var (
 	cache      = make(map[string]cacheEntry)
 	cacheMutex sync.RWMutex
 
-	// fileLogger will log query details to a file.
+	// fileLogger logs query details to a file.
 	fileLogger *log.Logger
 )
 
 // globalReqCount is a counter for all requests.
 var globalReqCount uint64
 
-// denyAAAA is set from the CLI flag; when true, AAAA answers will be removed if an A record exists.
+// denyAAAA is set via CLI flag; when true, AAAA answers will be removed if an A record exists.
 var denyAAAA bool
+
+// chinaList holds the domains/subdomains loaded from chinalist.txt.
+var chinaList map[string]bool
 
 // Enforce a minimum TTL so zero/low TTLs from upstream won't disable caching.
 const defaultMinTTL = 30
@@ -93,17 +100,17 @@ func getCachedResponse(key string) (*dns.Msg, bool) {
 
 	now := time.Now()
 	if now.After(entry.expires) {
-		// Expired—remove from cache
+		// Expired—remove from cache.
 		cacheMutex.Lock()
 		delete(cache, key)
 		cacheMutex.Unlock()
 		return nil, false
 	}
 
-	// Calculate remaining TTL
+	// Calculate remaining TTL (in seconds).
 	remainingSecs := uint32(entry.expires.Sub(now).Seconds())
 
-	// Create a copy and update its TTL values
+	// Create a copy and update TTL values.
 	response := entry.msg.Copy()
 	for i := range response.Answer {
 		response.Answer[i].Header().Ttl = remainingSecs
@@ -122,7 +129,7 @@ func getCachedResponse(key string) (*dns.Msg, bool) {
 func setCache(key string, msg *dns.Msg) {
 	var minTTL uint32 = 0xffffffff
 
-	// Find the minimum TTL in the entire response
+	// Find the minimum TTL in Answer, Ns, and Extra.
 	for _, rr := range msg.Answer {
 		if rr.Header().Ttl < minTTL {
 			minTTL = rr.Header().Ttl
@@ -139,11 +146,9 @@ func setCache(key string, msg *dns.Msg) {
 		}
 	}
 
-	// If the response has no records, fallback to 60
 	if minTTL == 0xffffffff {
 		minTTL = 60
 	} else if minTTL < defaultMinTTL {
-		// Enforce a minimum TTL
 		minTTL = defaultMinTTL
 	}
 
@@ -158,22 +163,17 @@ func setCache(key string, msg *dns.Msg) {
 		created:     now,
 	}
 	cacheMutex.Unlock()
-
-	// Uncomment for debugging:
-	// log.Printf("Caching response for key=%s with minTTL=%d", key, minTTL)
-	// fileLogger.Printf("Caching response for key=%s with minTTL=%d", key, minTTL)
 }
 
-// queryUpstreams sends the DNS query concurrently to all upstream servers and returns the reply
-// from the fastest server—with a short extra wait if the first reply is IPv6.
-func queryUpstreams(req *dns.Msg) (*dns.Msg, string, error) {
-	respCh := make(chan upstreamResponse, len(upstreams))
+// queryUpstreams sends the DNS query concurrently to the provided upstream servers and returns the fastest reply.
+func queryUpstreams(req *dns.Msg, ups []Upstream) (*dns.Msg, string, error) {
+	respCh := make(chan upstreamResponse, len(ups))
 
-	// Launch queries concurrently
-	for _, ups := range upstreams {
+	// Launch queries concurrently.
+	for _, u := range ups {
 		go func(u Upstream) {
 			if u.Protocol == "https" {
-				// DNS-over-HTTPS logic
+				// DNS-over-HTTPS logic.
 				httpClient := &http.Client{Timeout: 5 * time.Second}
 				packed, err := req.Pack()
 				if err != nil {
@@ -208,22 +208,22 @@ func queryUpstreams(req *dns.Msg) (*dns.Msg, string, error) {
 				}
 				respCh <- upstreamResponse{msg: &dohMsg, IsIPv4: u.IsIPv4, Source: u.Address, err: nil}
 			} else {
-				// UDP/TCP
+				// UDP/TCP exchange.
 				client := new(dns.Client)
 				client.Net = u.Protocol
 				r, _, err := client.Exchange(req, u.Address)
 				respCh <- upstreamResponse{msg: r, IsIPv4: u.IsIPv4, Source: u.Address, err: err}
 			}
-		}(ups)
+		}(u)
 	}
 
-	totalUpstreams := len(upstreams)
+	total := len(ups)
 	responsesReceived := 0
 	var candidate upstreamResponse
 	foundCandidate := false
 
-	// Wait for the first non-error response
-	for responsesReceived < totalUpstreams {
+	// Wait for the first successful response.
+	for responsesReceived < total {
 		resp := <-respCh
 		responsesReceived++
 		if resp.err != nil || resp.msg == nil {
@@ -233,21 +233,20 @@ func queryUpstreams(req *dns.Msg) (*dns.Msg, string, error) {
 		foundCandidate = true
 		break
 	}
-
 	if !foundCandidate {
 		return nil, "", errors.New("all upstream queries failed")
 	}
 
-	// If the first good reply is IPv4, return it immediately.
+	// If the first successful response is IPv4, return it immediately.
 	if candidate.IsIPv4 {
 		return candidate.msg, candidate.Source, nil
 	}
 
-	// If first good reply is IPv6, wait briefly for IPv4
+	// Otherwise, wait briefly for an IPv4 answer.
 	timer := time.NewTimer(20 * time.Millisecond)
 	defer timer.Stop()
 
-	for responsesReceived < totalUpstreams {
+	for responsesReceived < total {
 		select {
 		case resp := <-respCh:
 			responsesReceived++
@@ -255,12 +254,10 @@ func queryUpstreams(req *dns.Msg) (*dns.Msg, string, error) {
 				continue
 			}
 			if resp.IsIPv4 {
-				// Found IPv4—prefer it
 				candidate = resp
 				return candidate.msg, candidate.Source, nil
 			}
 		case <-timer.C:
-			// Timer expired; return the IPv6 answer
 			return candidate.msg, candidate.Source, nil
 		}
 	}
@@ -268,34 +265,94 @@ func queryUpstreams(req *dns.Msg) (*dns.Msg, string, error) {
 	return candidate.msg, candidate.Source, nil
 }
 
-// resolveDNS handles caching, upstream querying, and logging.
-// It now accepts additional parameters for protocol, a global request ID, and the start time.
+// isChinaDomain checks whether the given domain (or one of its parent domains) is in the China list.
+func isChinaDomain(domain string) bool {
+	d := strings.TrimSuffix(strings.ToLower(domain), ".")
+	parts := strings.Split(d, ".")
+	// Check each possible suffix.
+	for i := 0; i < len(parts); i++ {
+		candidate := strings.Join(parts[i:], ".")
+		if chinaList[candidate] {
+			return true
+		}
+	}
+	return false
+}
+
+// loadChinaList reads domains from the specified file (or URL) into a map.
+func loadChinaList(filename string) (map[string]bool, error) {
+	var reader io.Reader
+
+	if strings.HasPrefix(filename, "http") {
+		// Download from URL.
+		log.Printf("Downloading China list from %s", filename)
+		resp, err := http.Get(filename)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		reader = resp.Body
+	} else {
+		// Open local file.
+		f, err := os.Open(filename)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		reader = f
+	}
+
+	m := make(map[string]bool)
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// Normalize the domain: lower-case and remove trailing dot.
+		domain := strings.TrimSuffix(strings.ToLower(line), ".")
+		m[domain] = true
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// resolveDNS handles caching, upstream querying, and logging. It selects the upstream servers
+// based on whether the queried domain (or its parent) is in the China list.
 func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start time.Time) (*dns.Msg, string, error) {
 	domain := ""
 	if len(req.Question) > 0 {
 		domain = req.Question[0].Name
 	}
 
-	// Start building a single log line.
+	// Build a log line.
 	logLine := fmt.Sprintf("reqID=%d, remote=%s, domain=%s", reqID, remoteAddr, domain)
 
 	key := cacheKey(req)
 	if cachedMsg, found := getCachedResponse(key); found {
-		// If served from cache
 		cachedMsg.Id = req.Id
 		logLine += ", served=cache"
 		elapsed := time.Since(start)
 		ms := float64(elapsed.Nanoseconds()) / 1e6
 		logLine += fmt.Sprintf(", proto=%s, time=%.3fms", protocol, ms)
-
-		// Print once, in one line
 		log.Println(logLine)
 		fileLogger.Println(logLine)
 		return cachedMsg, "cache", nil
 	}
 
-	// Otherwise, query upstream
-	resp, fastest, err := queryUpstreams(req)
+	// Choose upstream servers based on whether the domain is in the China list.
+	var selectedUpstreams []Upstream
+	if isChinaDomain(domain) {
+		selectedUpstreams = upstreamsChina
+		logLine += ", upstream=china"
+	} else {
+		selectedUpstreams = upstreamsDefault
+		logLine += ", upstream=default"
+	}
+
+	resp, fastest, err := queryUpstreams(req, selectedUpstreams)
 	if err != nil {
 		logLine += fmt.Sprintf(", error=%v", err)
 		elapsed := time.Since(start)
@@ -306,42 +363,34 @@ func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start t
 		return nil, "", err
 	}
 
-	// Successful upstream response
 	resp.Id = req.Id
 	setCache(key, resp)
 	logLine += fmt.Sprintf(", served=upstream:%s", fastest)
 	elapsed := time.Since(start)
 	ms := float64(elapsed.Nanoseconds()) / 1e6
 	logLine += fmt.Sprintf(", proto=%s, time=%.3fms", protocol, ms)
-
-	// Print once, in one line
 	log.Println(logLine)
 	fileLogger.Println(logLine)
 
 	return resp, fastest, nil
 }
 
-// filterAAAAIfAExists checks for an A record for the queried domain and,
-// if found, removes any AAAA records from the response.
+// filterAAAAIfAExists checks for an A record for the queried domain and, if found,
+// removes any AAAA records from the response.
 func filterAAAAIfAExists(resp *dns.Msg, req *dns.Msg, remoteAddr, proto string, reqID uint64, start time.Time) *dns.Msg {
-	// Only apply if the query is AAAA and the CLI flag is set.
 	if len(req.Question) == 0 || req.Question[0].Qtype != dns.TypeAAAA || !denyAAAA {
 		return resp
 	}
 
-	// Create a new A query for the same domain.
 	aReq := new(dns.Msg)
 	aReq.SetQuestion(req.Question[0].Name, dns.TypeA)
-	// Increment the global request counter for this additional lookup.
 	newReqID := atomic.AddUint64(&globalReqCount, 1)
 	aResp, _, err := resolveDNS(remoteAddr, proto, aReq, newReqID, start)
 	if err == nil && len(aResp.Answer) > 0 {
-		// Log that we are denying AAAA records because an A record exists.
 		logLine := fmt.Sprintf("reqID=%d, domain=%s: AAAA response denied because A record exists", reqID, req.Question[0].Name)
 		log.Println(logLine)
 		fileLogger.Println(logLine)
 
-		// Remove any AAAA records from the Answer section.
 		var filteredAnswers []dns.RR
 		for _, rr := range resp.Answer {
 			if rr.Header().Rrtype != dns.TypeAAAA {
@@ -350,7 +399,6 @@ func filterAAAAIfAExists(resp *dns.Msg, req *dns.Msg, remoteAddr, proto string, 
 		}
 		resp.Answer = filteredAnswers
 
-		// Similarly, filter out AAAA records from the Extra section.
 		var filteredExtra []dns.RR
 		for _, rr := range resp.Extra {
 			if rr.Header().Rrtype != dns.TypeAAAA {
@@ -362,14 +410,12 @@ func filterAAAAIfAExists(resp *dns.Msg, req *dns.Msg, remoteAddr, proto string, 
 	return resp
 }
 
-// handleDNSRequest is the handler for DNS queries (used by UDP/TCP servers).
+// handleDNSRequest is the handler for DNS queries (UDP/TCP).
 func handleDNSRequest(w dns.ResponseWriter, req *dns.Msg) {
 	start := time.Now()
-	// Increment the global request counter.
 	reqID := atomic.AddUint64(&globalReqCount, 1)
-
 	remoteAddr := w.RemoteAddr().String()
-	// Determine protocol based on the underlying connection type.
+
 	var proto string
 	switch w.RemoteAddr().(type) {
 	case *net.UDPAddr:
@@ -388,7 +434,7 @@ func handleDNSRequest(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	// If this is a AAAA query and the denyAAAA flag is enabled, check for an A record.
+	// If it's a AAAA query and denyAAAA is enabled, filter out AAAA answers if an A record exists.
 	if len(req.Question) > 0 && req.Question[0].Qtype == dns.TypeAAAA && denyAAAA {
 		resp = filterAAAAIfAExists(resp, req, remoteAddr, proto, reqID, start)
 	}
@@ -406,7 +452,6 @@ func dohHandler(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		// Expect ?dns= (base64url-encoded)
 		dnsParam := r.URL.Query().Get("dns")
 		if dnsParam == "" {
 			http.Error(w, "missing 'dns' parameter", http.StatusBadRequest)
@@ -422,7 +467,6 @@ func dohHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case http.MethodPost:
-		// POST body should be raw DNS message
 		data, err := io.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, "failed to read request body", http.StatusBadRequest)
@@ -445,12 +489,10 @@ func dohHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If this is a AAAA query and the denyAAAA flag is enabled, check for an A record.
 	if len(reqMsg.Question) > 0 && reqMsg.Question[0].Qtype == dns.TypeAAAA && denyAAAA {
 		resp = filterAAAAIfAExists(resp, &reqMsg, remoteAddr, proto, reqID, start)
 	}
 
-	// Pack the DNS response.
 	packed, err := resp.Pack()
 	if err != nil {
 		http.Error(w, "failed to pack DNS response", http.StatusInternalServerError)
@@ -465,24 +507,41 @@ func dohHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	// Define the CLI flag.
-	denyAAAAFlag := flag.Bool("denyAAAA", true, "Deny IPv6 AAAA records if an A record for the domain exists")
+	denyAAAAFlag := flag.Bool("denyAAAA", true, "Deny IPv6 AAAA records if an A record exists")
 	expireMultiplierFlag := flag.Int("expireMultiplier", 10, "Multiplier for the cache expiration time")
+	chinaListFile := flag.String("chinaList", "chinalist.txt", "Path to the China list file")
 	flag.Parse()
 	denyAAAA = *denyAAAAFlag
-	EXPIRE_MULTIPLIER  = *expireMultiplierFlag
+	EXPIRE_MULTIPLIER = *expireMultiplierFlag
 
-	// Open (or create) a log file to record queries.
+	// Load the China list.
+	var err error
+	chinaList, err = loadChinaList(*chinaListFile)
+	if err != nil {
+		//log.Fatalf("Failed to load China list: %v", err)
+		//download from https://raw.githubusercontent.com/pexcn/openwrt-chinadns-ng/refs/heads/master/files/chinalist.txt
+		chinaList, err = loadChinaList("https://raw.githubusercontent.com/pexcn/openwrt-chinadns-ng/refs/heads/master/files/chinalist.txt")
+		if err != nil {
+			log.Fatalf("Failed to load China list: %v", err)
+			os.Exit(1)
+		} else {
+			log.Printf("Downloaded %d entries from %s")
+		}
+	} else {
+		log.Printf("Loaded %d entries from %s", len(chinaList), *chinaListFile)
+	}
+
+
+	// Open (or create) a log file.
 	f, err := os.OpenFile("dns_queries.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Fatalf("Failed to open log file: %v", err)
 	}
 	fileLogger = log.New(f, "", log.LstdFlags)
 
-	// Set up the DNS handler (UDP and TCP).
+	// Set up DNS handlers (UDP and TCP).
 	dns.HandleFunc(".", handleDNSRequest)
 
-	// Start DNS on UDP
 	udpServer := &dns.Server{
 		Addr:    ":53",
 		Net:     "udp",
@@ -495,7 +554,6 @@ func main() {
 		}
 	}()
 
-	// Start DNS on TCP
 	tcpServer := &dns.Server{
 		Addr:    ":53",
 		Net:     "tcp",
@@ -508,7 +566,6 @@ func main() {
 		}
 	}()
 
-	// Start HTTP (DoH) on :8080
 	http.HandleFunc("/dns-query", dohHandler)
 	go func() {
 		httpAddr := ":8080"
