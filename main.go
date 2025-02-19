@@ -90,6 +90,15 @@ var chinaList map[string]bool
 // Enforce a minimum TTL so zero/low TTLs from upstream won't disable caching.
 const defaultMinTTL = 30
 
+// ANSI color codes
+const (
+	colorRed    = "\033[31m"
+	colorGreen  = "\033[32m"
+	colorBlue   = "\033[34m"
+	colorYellow = "\033[33m"
+	colorReset  = "\033[0m"
+)
+
 // cacheKey builds a key for caching based on the first question.
 func cacheKey(req *dns.Msg) string {
 	if len(req.Question) > 0 {
@@ -356,19 +365,22 @@ func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start t
 		elapsed := time.Since(start)
 		ms := float64(elapsed.Nanoseconds()) / 1e6
 		logLine += fmt.Sprintf(", from=%s, time=%.3fms", protocol, ms)
-		log.Println(logLine)
+		fmt.Printf("%s%s%s\n", colorGreen, logLine, colorReset)
 		fileLogger.Println(logLine)
 		return cachedMsg, "cache", nil
 	}
 
-	// Choose upstreams.
+	// Choose upstreams and set color
 	var selectedUpstreams []Upstream
+	var color string
 	if isChinaDomain(domain) {
 		selectedUpstreams = upstreamsChina
 		logLine += ", upstream=china"
+		color = colorBlue
 	} else {
 		selectedUpstreams = upstreamsDefault
 		logLine += ", upstream=default"
+		color = colorYellow
 	}
 
 	// Use singleflight to collapse duplicate in-flight queries.
@@ -388,7 +400,7 @@ func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start t
 		elapsed := time.Since(start)
 		ms := float64(elapsed.Nanoseconds()) / 1e6
 		logLine += fmt.Sprintf(", proto=%s, time=%.3fms", protocol, ms)
-		log.Println(logLine)
+		fmt.Printf("%s%s%s\n", colorRed, logLine, colorReset)
 		fileLogger.Println(logLine)
 		return nil, "", err
 	}
@@ -397,7 +409,7 @@ func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start t
 	elapsed := time.Since(start)
 	ms := float64(elapsed.Nanoseconds()) / 1e6
 	logLine += fmt.Sprintf(", served=upstream:%s, proto=%s, time=%.3fms", result.fastest, protocol, ms)
-	log.Println(logLine)
+	fmt.Printf("%s%s%s\n", color, logLine, colorReset)
 	fileLogger.Println(logLine)
 	return result.msg, result.fastest, nil
 }
@@ -534,6 +546,7 @@ func dohHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	log.Println("\033[32m" + "Welcome to c2dns" + "\033[0m")
 	denyAAAAFlag := flag.Bool("denyAAAA", true, "Deny IPv6 AAAA records if an A record exists")
 	expireMultiplierFlag := flag.Int("expireMultiplier", 10, "Multiplier for the cache expiration time")
 	chinaListFile := flag.String("chinaList", "chinalist.txt", "Path to the China list file")
