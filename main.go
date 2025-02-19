@@ -6,14 +6,18 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
 )
+
+const EXPIRE_MULTIPLIER = 10
 
 // Upstream represents an upstream DNS server.
 type Upstream struct {
@@ -56,6 +60,9 @@ var (
 	// fileLogger will log query details to a file.
 	fileLogger *log.Logger
 )
+
+// globalReqCount is a counter for all requests.
+var globalReqCount uint64
 
 // Enforce a minimum TTL so zero/low TTLs from upstream won't disable caching.
 const defaultMinTTL = 30
@@ -139,7 +146,7 @@ func setCache(key string, msg *dns.Msg) {
 	}
 
 	now := time.Now()
-	expires := now.Add(time.Duration(minTTL) * time.Second)
+	expires := now.Add(time.Duration(minTTL) * time.Second * EXPIRE_MULTIPLIER)
 
 	cacheMutex.Lock()
 	cache[key] = cacheEntry{
@@ -150,8 +157,8 @@ func setCache(key string, msg *dns.Msg) {
 	}
 	cacheMutex.Unlock()
 
-	log.Printf("Caching response for key=%s with minTTL=%d", key, minTTL)
-	fileLogger.Printf("Caching response for key=%s with minTTL=%d", key, minTTL)
+	//log.Printf("Caching response for key=%s with minTTL=%d", key, minTTL)
+	//fileLogger.Printf("Caching response for key=%s with minTTL=%d", key, minTTL)
 }
 
 // queryUpstreams sends the DNS query concurrently to all upstream servers and returns the reply
@@ -259,54 +266,77 @@ func queryUpstreams(req *dns.Msg) (*dns.Msg, string, error) {
 }
 
 // resolveDNS handles caching, upstream querying, and logging.
-func resolveDNS(remoteAddr string, req *dns.Msg) (*dns.Msg, string, error) {
-    domain := ""
-    if len(req.Question) > 0 {
-        domain = req.Question[0].Name
-    }
+// It now accepts additional parameters for protocol, a global request ID, and the start time.
+func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start time.Time) (*dns.Msg, string, error) {
+	domain := ""
+	if len(req.Question) > 0 {
+		domain = req.Question[0].Name
+	}
 
-    // Start building a single log line. Use whatever format/fields you like:
-    logLine := fmt.Sprintf("remote=%s, domain=%s", remoteAddr, domain)
+	// Start building a single log line.
+	logLine := fmt.Sprintf("reqID=%d, remote=%s, domain=%s", reqID, remoteAddr, domain)
+	
+	key := cacheKey(req)
+	if cachedMsg, found := getCachedResponse(key); found {
+		// If served from cache
+		cachedMsg.Id = req.Id
+		logLine += ", served=cache"
+		elapsed := time.Since(start)
+		ms := float64(elapsed.Nanoseconds()) / 1e6
+		logLine += fmt.Sprintf(", proto=%s, time=%.3fms", protocol, ms)
 
-    key := cacheKey(req)
-    if cachedMsg, found := getCachedResponse(key); found {
-        // If served from cache
-        cachedMsg.Id = req.Id
-        logLine += ", served=cache"
+		// Print once, in one line
+		log.Println(logLine)
+		fileLogger.Println(logLine)
+		return cachedMsg, "cache", nil
+	}
 
-        // Print once, in one line
-        log.Println(logLine)
-        fileLogger.Println(logLine)
-        return cachedMsg, "cache", nil
-    }
+	// Otherwise, query upstream
+	resp, fastest, err := queryUpstreams(req)
+	if err != nil {
+		logLine += fmt.Sprintf(", error=%v", err)
+		elapsed := time.Since(start)
+		ms := float64(elapsed.Nanoseconds()) / 1e6
+		logLine += fmt.Sprintf(", proto=%s, time=%.3fms", protocol, ms)
+		log.Println(logLine)
+		fileLogger.Println(logLine)
+		return nil, "", err
+	}
 
-    // Otherwise, query upstream
-    resp, fastest, err := queryUpstreams(req)
-    if err != nil {
-        // If upstream query failed
-        logLine += fmt.Sprintf(", error=%v", err)
-        log.Println(logLine)
-        fileLogger.Println(logLine)
-        return nil, "", err
-    }
+	// Successful upstream response
+	resp.Id = req.Id
+	setCache(key, resp)
+	logLine += fmt.Sprintf(", served=upstream:%s", fastest)
+	elapsed := time.Since(start)
+	ms := float64(elapsed.Nanoseconds()) / 1e6
+	logLine += fmt.Sprintf(", proto=%s, time=%.3fms", protocol, ms)
 
-    // Successful upstream response
-    resp.Id = req.Id
-    setCache(key, resp)
-    logLine += fmt.Sprintf(", served=upstream:%s", fastest)
+	// Print once, in one line
+	log.Println(logLine)
+	fileLogger.Println(logLine)
 
-    // Print once, in one line
-    log.Println(logLine)
-    fileLogger.Println(logLine)
-
-    return resp, fastest, nil
+	return resp, fastest, nil
 }
-
 
 // handleDNSRequest is the handler for DNS queries (used by UDP/TCP servers).
 func handleDNSRequest(w dns.ResponseWriter, req *dns.Msg) {
+	start := time.Now()
+	// Increment the global request counter.
+	reqID := atomic.AddUint64(&globalReqCount, 1)
+
 	remoteAddr := w.RemoteAddr().String()
-	resp, _, err := resolveDNS(remoteAddr, req)
+	// Determine protocol based on the underlying connection type.
+	var proto string
+	switch w.RemoteAddr().(type) {
+	case *net.UDPAddr:
+		proto = "udp53"
+	case *net.TCPAddr:
+		proto = "tcp53"
+	default:
+		proto = "unknown"
+	}
+
+	resp, _, err := resolveDNS(remoteAddr, proto, req, reqID, start)
 	if err != nil {
 		m := new(dns.Msg)
 		m.SetRcode(req, dns.RcodeServerFailure)
@@ -319,6 +349,9 @@ func handleDNSRequest(w dns.ResponseWriter, req *dns.Msg) {
 // dohHandler implements a simple DNS-over-HTTPS (DoH) endpoint.
 // It supports GET (with base64url-encoded "dns" parameter) and POST (raw DNS message).
 func dohHandler(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	reqID := atomic.AddUint64(&globalReqCount, 1)
+
 	var reqMsg dns.Msg
 	var err error
 
@@ -356,7 +389,7 @@ func dohHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	remoteAddr := r.RemoteAddr
-	resp, _, err := resolveDNS(remoteAddr, &reqMsg)
+	resp, _, err := resolveDNS(remoteAddr, "http", &reqMsg, reqID, start)
 	if err != nil {
 		http.Error(w, "DNS query failed", http.StatusInternalServerError)
 		return
