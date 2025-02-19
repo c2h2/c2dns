@@ -17,9 +17,17 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"golang.org/x/sync/singleflight"
 )
 
 var EXPIRE_MULTIPLIER int
+var requestGroup singleflight.Group
+
+// upstreamResult holds the result from an upstream query.
+type upstreamResult struct {
+	msg     *dns.Msg
+	fastest string
+}
 
 // Upstream represents an upstream DNS server.
 type Upstream struct {
@@ -31,14 +39,18 @@ type Upstream struct {
 // upstreamsChina is used for domains in the China list.
 var upstreamsChina = []Upstream{
 	{Address: "223.5.5.5:53", IsIPv4: true, Protocol: "udp"},
+	{Address: "223.6.6.6:53", IsIPv4: true, Protocol: "udp"},
 }
 
 // upstreamsDefault is used for other domains.
 var upstreamsDefault = []Upstream{
-	/*{Address: "8.8.8.8:53", IsIPv4: true, Protocol: "udp"},
-	{Address: "8.8.4.4:53", IsIPv4: true, Protocol: "udp"},*/
+	{Address: "1.1.1.1:53", IsIPv4: true, Protocol: "udp"},
+	{Address: "8.8.8.8:53", IsIPv4: true, Protocol: "udp"},
+	{Address: "8.8.4.4:53", IsIPv4: true, Protocol: "udp"},
+	{Address: "9.9.9.9:53", IsIPv4: true, Protocol: "udp"},
 	// DNS-over-HTTPS example:
 	{Address: "https://1.1.1.1/dns-query", IsIPv4: true, Protocol: "https"},
+	{Address: "https://8.8.8.8/dns-query", IsIPv4: true, Protocol: "https"},
 }
 
 // upstreamResponse carries the result of one upstream query.
@@ -233,8 +245,15 @@ func queryUpstreams(req *dns.Msg, ups []Upstream) (*dns.Msg, string, error) {
 		foundCandidate = true
 		break
 	}
+
 	if !foundCandidate {
-		return nil, "", errors.New("all upstream queries failed")
+		//wait for all upstreams to finish
+		for range ups {
+			<-respCh
+		}
+		if !foundCandidate {
+			return nil, "", errors.New("all upstream queries failed")
+		}
 	}
 
 	// If the first successful response is IPv4, return it immediately.
@@ -326,23 +345,23 @@ func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start t
 	if len(req.Question) > 0 {
 		domain = req.Question[0].Name
 	}
-
 	// Build a log line.
 	logLine := fmt.Sprintf("reqID=%d, remote=%s, domain=%s", reqID, remoteAddr, domain)
 
 	key := cacheKey(req)
+	// Check cache.
 	if cachedMsg, found := getCachedResponse(key); found {
 		cachedMsg.Id = req.Id
 		logLine += ", served=cache"
 		elapsed := time.Since(start)
 		ms := float64(elapsed.Nanoseconds()) / 1e6
-		logLine += fmt.Sprintf(", proto=%s, time=%.3fms", protocol, ms)
+		logLine += fmt.Sprintf(", from=%s, time=%.3fms", protocol, ms)
 		log.Println(logLine)
 		fileLogger.Println(logLine)
 		return cachedMsg, "cache", nil
 	}
 
-	// Choose upstream servers based on whether the domain is in the China list.
+	// Choose upstreams.
 	var selectedUpstreams []Upstream
 	if isChinaDomain(domain) {
 		selectedUpstreams = upstreamsChina
@@ -352,7 +371,18 @@ func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start t
 		logLine += ", upstream=default"
 	}
 
-	resp, fastest, err := queryUpstreams(req, selectedUpstreams)
+	// Use singleflight to collapse duplicate in-flight queries.
+	v, err, _ := requestGroup.Do(key, func() (interface{}, error) {
+		resp, fastest, err := queryUpstreams(req, selectedUpstreams)
+		if err != nil {
+			return nil, err
+		}
+		resp.Id = req.Id
+		// Cache the response.
+		setCache(key, resp)
+		return upstreamResult{msg: resp, fastest: fastest}, nil
+	})
+
 	if err != nil {
 		logLine += fmt.Sprintf(", error=%v", err)
 		elapsed := time.Since(start)
@@ -363,16 +393,13 @@ func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start t
 		return nil, "", err
 	}
 
-	resp.Id = req.Id
-	setCache(key, resp)
-	logLine += fmt.Sprintf(", served=upstream:%s", fastest)
+	result := v.(upstreamResult)
 	elapsed := time.Since(start)
 	ms := float64(elapsed.Nanoseconds()) / 1e6
-	logLine += fmt.Sprintf(", proto=%s, time=%.3fms", protocol, ms)
+	logLine += fmt.Sprintf(", served=upstream:%s, proto=%s, time=%.3fms", result.fastest, protocol, ms)
 	log.Println(logLine)
 	fileLogger.Println(logLine)
-
-	return resp, fastest, nil
+	return result.msg, result.fastest, nil
 }
 
 // filterAAAAIfAExists checks for an A record for the queried domain and, if found,
@@ -388,7 +415,7 @@ func filterAAAAIfAExists(resp *dns.Msg, req *dns.Msg, remoteAddr, proto string, 
 	aResp, _, err := resolveDNS(remoteAddr, proto, aReq, newReqID, start)
 	if err == nil && len(aResp.Answer) > 0 {
 		logLine := fmt.Sprintf("reqID=%d, domain=%s: AAAA response denied because A record exists", reqID, req.Question[0].Name)
-		log.Println(logLine)
+		//log.Println(logLine)
 		fileLogger.Println(logLine)
 
 		var filteredAnswers []dns.RR
