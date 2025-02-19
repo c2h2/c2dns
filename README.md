@@ -19,7 +19,7 @@ c2dns is a lightweight, high-speed DNS resolver written in Go 🚀. c2dns 是一
 ## Installation 🔧
 
 ```bash
-git clone https://github.com/yourusername/c2dns.git
+git clone https://github.com/c2h2/c2dns.git
 cd c2dns
 go build -o c2dns
 ```
