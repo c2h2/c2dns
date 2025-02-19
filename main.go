@@ -260,40 +260,48 @@ func queryUpstreams(req *dns.Msg) (*dns.Msg, string, error) {
 
 // resolveDNS handles caching, upstream querying, and logging.
 func resolveDNS(remoteAddr string, req *dns.Msg) (*dns.Msg, string, error) {
-	var domain string
-	if len(req.Question) > 0 {
-		domain = req.Question[0].Name
-	}
+    domain := ""
+    if len(req.Question) > 0 {
+        domain = req.Question[0].Name
+    }
 
-	// Log the incoming query.
-	log.Printf("Received query from %s for %s", remoteAddr, domain)
-	fileLogger.Printf("Received query from %s for %s", remoteAddr, domain)
+    // Start building a single log line. Use whatever format/fields you like:
+    logLine := fmt.Sprintf("remote=%s, domain=%s", remoteAddr, domain)
 
-	key := cacheKey(req)
-	if cachedMsg, found := getCachedResponse(key); found {
-		cachedMsg.Id = req.Id
-		log.Printf("Serving from cache for %s (client: %s)", domain, remoteAddr)
-		fileLogger.Printf("Serving from cache for %s (client: %s)", domain, remoteAddr)
-		return cachedMsg, "cache", nil
-	}
+    key := cacheKey(req)
+    if cachedMsg, found := getCachedResponse(key); found {
+        // If served from cache
+        cachedMsg.Id = req.Id
+        logLine += ", served=cache"
 
-	// Not in cache or expired; query upstream
-	resp, fastest, err := queryUpstreams(req)
-	if err != nil {
-		log.Printf("Error resolving %s for %s: %v", domain, remoteAddr, err)
-		fileLogger.Printf("Error resolving %s for %s: %v", domain, remoteAddr, err)
-		return nil, "", err
-	}
-	resp.Id = req.Id
+        // Print once, in one line
+        log.Println(logLine)
+        fileLogger.Println(logLine)
+        return cachedMsg, "cache", nil
+    }
 
-	log.Printf("Responding to query for %s from client %s via upstream %s", domain, remoteAddr, fastest)
-	fileLogger.Printf("Responding to query for %s from client %s via upstream %s", domain, remoteAddr, fastest)
+    // Otherwise, query upstream
+    resp, fastest, err := queryUpstreams(req)
+    if err != nil {
+        // If upstream query failed
+        logLine += fmt.Sprintf(", error=%v", err)
+        log.Println(logLine)
+        fileLogger.Println(logLine)
+        return nil, "", err
+    }
 
-	// Cache the new response
-	setCache(key, resp)
+    // Successful upstream response
+    resp.Id = req.Id
+    setCache(key, resp)
+    logLine += fmt.Sprintf(", served=upstream:%s", fastest)
 
-	return resp, fastest, nil
+    // Print once, in one line
+    log.Println(logLine)
+    fileLogger.Println(logLine)
+
+    return resp, fastest, nil
 }
+
 
 // handleDNSRequest is the handler for DNS queries (used by UDP/TCP servers).
 func handleDNSRequest(w dns.ResponseWriter, req *dns.Msg) {
