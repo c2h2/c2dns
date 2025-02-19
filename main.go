@@ -23,6 +23,12 @@ import (
 var EXPIRE_MULTIPLIER int
 var requestGroup singleflight.Group
 
+// Global counters.
+var globalReqCount uint64
+var globalFailedCount uint64
+var globalCacheHits uint64
+var globalDeniedAAAA uint64
+
 // upstreamResult holds the result from an upstream query.
 type upstreamResult struct {
 	msg     *dns.Msg
@@ -77,9 +83,6 @@ var (
 	// fileLogger logs query details to a file.
 	fileLogger *log.Logger
 )
-
-// globalReqCount is a counter for all requests.
-var globalReqCount uint64
 
 // denyAAAA is set via CLI flag; when true, AAAA answers will be removed if an A record exists.
 var denyAAAA bool
@@ -256,7 +259,7 @@ func queryUpstreams(req *dns.Msg, ups []Upstream) (*dns.Msg, string, error) {
 	}
 
 	if !foundCandidate {
-		//wait for all upstreams to finish
+		// Wait for all upstreams to finish.
 		for range ups {
 			<-respCh
 		}
@@ -360,6 +363,8 @@ func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start t
 	key := cacheKey(req)
 	// Check cache.
 	if cachedMsg, found := getCachedResponse(key); found {
+		// Count a cache hit.
+		atomic.AddUint64(&globalCacheHits, 1)
 		cachedMsg.Id = req.Id
 		logLine += ", served=cache"
 		elapsed := time.Since(start)
@@ -370,7 +375,7 @@ func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start t
 		return cachedMsg, "cache", nil
 	}
 
-	// Choose upstreams and set color
+	// Choose upstreams and set color.
 	var selectedUpstreams []Upstream
 	var color string
 	if isChinaDomain(domain) {
@@ -402,6 +407,7 @@ func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start t
 		logLine += fmt.Sprintf(", proto=%s, time=%.3fms", protocol, ms)
 		fmt.Printf("%s%s%s\n", colorRed, logLine, colorReset)
 		fileLogger.Println(logLine)
+		atomic.AddUint64(&globalFailedCount, 1)
 		return nil, "", err
 	}
 
@@ -426,8 +432,8 @@ func filterAAAAIfAExists(resp *dns.Msg, req *dns.Msg, remoteAddr, proto string, 
 	newReqID := atomic.AddUint64(&globalReqCount, 1)
 	aResp, _, err := resolveDNS(remoteAddr, proto, aReq, newReqID, start)
 	if err == nil && len(aResp.Answer) > 0 {
+		atomic.AddUint64(&globalDeniedAAAA, 1)
 		logLine := fmt.Sprintf("reqID=%d, domain=%s: AAAA response denied because A record exists", reqID, req.Question[0].Name)
-		//log.Println(logLine)
 		fileLogger.Println(logLine)
 
 		var filteredAnswers []dns.RR
@@ -545,6 +551,53 @@ func dohHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// printCacheStats prints statistics about the cache every 10 seconds.
+func printCacheStats() {
+	startTime := time.Now()
+	ticker := time.NewTicker(10 * time.Second)
+	for range ticker.C {
+		now := time.Now()
+		cacheMutex.RLock()
+		total := len(cache)
+		expired := 0
+		valid := 0
+		for _, entry := range cache {
+			if now.After(entry.expires) {
+				expired++
+			} else {
+				valid++
+			}
+		}
+		cacheMutex.RUnlock()
+
+		// Uptime formatting: if less than 1 day, show hours/minutes/seconds.
+		uptime := now.Sub(startTime)
+		days := int(uptime.Hours()) / 24
+		var uptimeStr string
+		if days > 0 {
+			uptimeStr = fmt.Sprintf("%d D, %d H, %d M", days, int(uptime.Hours())%24, int(uptime.Minutes())%60)
+		} else {
+			uptimeStr = fmt.Sprintf("%d H, %d M, %d S", int(uptime.Hours()), int(uptime.Minutes())%60, int(uptime.Seconds())%60)
+		}
+
+		requests := atomic.LoadUint64(&globalReqCount)
+		requestsPerSecond := float64(requests) / uptime.Seconds()
+		cacheHits := atomic.LoadUint64(&globalCacheHits)
+		var cacheHitRate float64
+		if requests > 0 {
+			cacheHitRate = float64(cacheHits) / float64(requests) * 100
+		}
+		failed := atomic.LoadUint64(&globalFailedCount)
+		deniedAAAA := atomic.LoadUint64(&globalDeniedAAAA)
+		
+		banner := fmt.Sprintf("==========Cache Stats | Uptime: %s==========", uptimeStr)
+		fmt.Println(banner)
+		fmt.Printf("%sTotal Cache Entries=%d, Valid=%d, Expired=%d, Failed=%d, DeniedAAAA=%d%s\n", colorGreen, total, valid, expired, failed, deniedAAAA, colorReset)
+		fmt.Printf("%sTotal DNS Requests=%d, ReqPerSec=%.2f, Cache Hit Rate=%.2f%%, Cache Miss Rate=%.2f%%%s\n", colorGreen, requests, requestsPerSecond, cacheHitRate, 100 - cacheHitRate, colorReset)
+		fmt.Println(strings.Repeat("=", len(banner)))
+	}
+}
+
 func main() {
 	log.Println("\033[32m" + "Welcome to c2dns" + "\033[0m")
 	denyAAAAFlag := flag.Bool("denyAAAA", true, "Deny IPv6 AAAA records if an A record exists")
@@ -558,19 +611,17 @@ func main() {
 	var err error
 	chinaList, err = loadChinaList(*chinaListFile)
 	if err != nil {
-		//log.Fatalf("Failed to load China list: %v", err)
-		//download from https://raw.githubusercontent.com/pexcn/openwrt-chinadns-ng/refs/heads/master/files/chinalist.txt
+		// Attempt to download from an alternative URL.
 		chinaList, err = loadChinaList("https://raw.githubusercontent.com/pexcn/openwrt-chinadns-ng/refs/heads/master/files/chinalist.txt")
 		if err != nil {
 			log.Fatalf("Failed to load China list: %v", err)
 			os.Exit(1)
 		} else {
-			log.Printf("Downloaded %d entries from %s")
+			log.Printf("Downloaded %d entries from the remote China list", len(chinaList))
 		}
 	} else {
 		log.Printf("Loaded %d entries from %s", len(chinaList), *chinaListFile)
 	}
-
 
 	// Open (or create) a log file.
 	f, err := os.OpenFile("dns_queries.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -578,6 +629,8 @@ func main() {
 		log.Fatalf("Failed to open log file: %v", err)
 	}
 	fileLogger = log.New(f, "", log.LstdFlags)
+
+	go printCacheStats()
 
 	// Set up DNS handlers (UDP and TCP).
 	dns.HandleFunc(".", handleDNSRequest)
