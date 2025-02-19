@@ -41,8 +41,10 @@ type upstreamResponse struct {
 
 // cacheEntry holds a cached DNS reply with its expiration time.
 type cacheEntry struct {
-	msg     *dns.Msg
-	expires time.Time
+	msg        *dns.Msg
+	expires    time.Time
+	originalTTL uint32    // Store the original TTL for calculations
+	created    time.Time  // When this entry was created
 }
 
 var (
@@ -68,37 +70,73 @@ func getCachedResponse(key string) (*dns.Msg, bool) {
 	cacheMutex.RLock()
 	entry, found := cache[key]
 	cacheMutex.RUnlock()
+	
 	if !found {
 		return nil, false
 	}
-	if time.Now().After(entry.expires) {
-		// Expired—remove from cache.
+
+	now := time.Now()
+	if now.After(entry.expires) {
+		// Expired—remove from cache
 		cacheMutex.Lock()
 		delete(cache, key)
 		cacheMutex.Unlock()
 		return nil, false
 	}
-	// Return a copy so further modifications don’t affect the cached copy.
-	return entry.msg.Copy(), true
+
+	// Calculate remaining TTL
+	remainingSecs := uint32(entry.expires.Sub(now).Seconds())
+	
+	// Create a copy and update its TTL values
+	response := entry.msg.Copy()
+	for i := range response.Answer {
+		response.Answer[i].Header().Ttl = remainingSecs
+	}
+	for i := range response.Ns {
+		response.Ns[i].Header().Ttl = remainingSecs
+	}
+	for i := range response.Extra {
+		response.Extra[i].Header().Ttl = remainingSecs
+	}
+
+	return response, true
 }
 
 // setCache stores the reply in the cache using the smallest TTL found in the answer section.
 func setCache(key string, msg *dns.Msg) {
 	var minTTL uint32 = 0xffffffff
+	
+	// Find minimum TTL from all sections
 	for _, rr := range msg.Answer {
 		if rr.Header().Ttl < minTTL {
 			minTTL = rr.Header().Ttl
 		}
 	}
+	for _, rr := range msg.Ns {
+		if rr.Header().Ttl < minTTL {
+			minTTL = rr.Header().Ttl
+		}
+	}
+	for _, rr := range msg.Extra {
+		if rr.Header().Ttl < minTTL {
+			minTTL = rr.Header().Ttl
+		}
+	}
+
 	if minTTL == 0xffffffff {
-		// No answer records? Use a default TTL.
+		// No records? Use a default TTL
 		minTTL = 60
 	}
-	expires := time.Now().Add(time.Duration(minTTL) * time.Second)
+
+	now := time.Now()
+	expires := now.Add(time.Duration(minTTL) * time.Second)
+	
 	cacheMutex.Lock()
 	cache[key] = cacheEntry{
-		msg:     msg.Copy(),
-		expires: expires,
+		msg:        msg.Copy(),
+		expires:    expires,
+		originalTTL: minTTL,
+		created:    now,
 	}
 	cacheMutex.Unlock()
 }
