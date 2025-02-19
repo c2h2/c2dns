@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,10 +24,10 @@ type Upstream struct {
 
 // Upstream servers to query (order doesn’t matter since we query concurrently).
 var upstreams = []Upstream{
-	{Address: "8.8.8.8:53", IsIPv4: true, Protocol: "udp"},
+	/*{Address: "8.8.8.8:53", IsIPv4: true, Protocol: "udp"},
 	{Address: "8.8.4.4:53", IsIPv4: true, Protocol: "udp"},
 	{Address: "[2001:4860:4860::8888]:53", IsIPv4: false, Protocol: "udp"},
-	{Address: "[2001:4860:4860::8844]:53", IsIPv4: false, Protocol: "udp"},
+	{Address: "[2001:4860:4860::8844]:53", IsIPv4: false, Protocol: "udp"},*/
 	// DNS-over-HTTPS upstream (Cloudflare DoH endpoint)
 	{Address: "https://1.1.1.1/dns-query", IsIPv4: true, Protocol: "https"},
 }
@@ -41,14 +42,14 @@ type upstreamResponse struct {
 
 // cacheEntry holds a cached DNS reply with its expiration time.
 type cacheEntry struct {
-	msg        *dns.Msg
-	expires    time.Time
-	originalTTL uint32    // Store the original TTL for calculations
-	created    time.Time  // When this entry was created
+	msg         *dns.Msg
+	expires     time.Time
+	originalTTL uint32
+	created     time.Time
 }
 
+// cache stores responses keyed by the query (question name + type).
 var (
-	// cache stores responses keyed by the query (question name + type).
 	cache      = make(map[string]cacheEntry)
 	cacheMutex sync.RWMutex
 
@@ -56,11 +57,17 @@ var (
 	fileLogger *log.Logger
 )
 
+// Enforce a minimum TTL so zero/low TTLs from upstream won't disable caching.
+const defaultMinTTL = 30
+
 // cacheKey builds a key for caching based on the first question.
+// We canonicalize by lowercasing and calling dns.Fqdn() so that
+// "Example.com" vs. "example.com." become consistent keys.
 func cacheKey(req *dns.Msg) string {
 	if len(req.Question) > 0 {
 		q := req.Question[0]
-		return q.Name + ":" + dns.TypeToString[q.Qtype]
+		name := strings.ToLower(dns.Fqdn(q.Name))
+		return name + ":" + dns.TypeToString[q.Qtype]
 	}
 	return ""
 }
@@ -70,7 +77,7 @@ func getCachedResponse(key string) (*dns.Msg, bool) {
 	cacheMutex.RLock()
 	entry, found := cache[key]
 	cacheMutex.RUnlock()
-	
+
 	if !found {
 		return nil, false
 	}
@@ -86,7 +93,7 @@ func getCachedResponse(key string) (*dns.Msg, bool) {
 
 	// Calculate remaining TTL
 	remainingSecs := uint32(entry.expires.Sub(now).Seconds())
-	
+
 	// Create a copy and update its TTL values
 	response := entry.msg.Copy()
 	for i := range response.Answer {
@@ -102,11 +109,11 @@ func getCachedResponse(key string) (*dns.Msg, bool) {
 	return response, true
 }
 
-// setCache stores the reply in the cache using the smallest TTL found in the answer section.
+// setCache stores the reply in the cache using the smallest TTL found in the message (Answer/Ns/Extra).
 func setCache(key string, msg *dns.Msg) {
 	var minTTL uint32 = 0xffffffff
-	
-	// Find minimum TTL from all sections
+
+	// Find the minimum TTL in the entire response
 	for _, rr := range msg.Answer {
 		if rr.Header().Ttl < minTTL {
 			minTTL = rr.Header().Ttl
@@ -123,43 +130,46 @@ func setCache(key string, msg *dns.Msg) {
 		}
 	}
 
+	// If the response has no records, fallback to 60
 	if minTTL == 0xffffffff {
-		// No records? Use a default TTL
 		minTTL = 60
+	} else if minTTL < defaultMinTTL {
+		// Enforce a minimum TTL
+		minTTL = defaultMinTTL
 	}
 
 	now := time.Now()
 	expires := now.Add(time.Duration(minTTL) * time.Second)
-	
+
 	cacheMutex.Lock()
 	cache[key] = cacheEntry{
-		msg:        msg.Copy(),
-		expires:    expires,
+		msg:         msg.Copy(),
+		expires:     expires,
 		originalTTL: minTTL,
-		created:    now,
+		created:     now,
 	}
 	cacheMutex.Unlock()
+
+	log.Printf("Caching response for key=%s with minTTL=%d", key, minTTL)
+	fileLogger.Printf("Caching response for key=%s with minTTL=%d", key, minTTL)
 }
 
 // queryUpstreams sends the DNS query concurrently to all upstream servers and returns the reply
 // from the fastest server—with a short extra wait if the first reply is IPv6 (to see if an IPv4 answer arrives).
-// It returns the DNS reply, the upstream server address that responded fastest, and any error.
 func queryUpstreams(req *dns.Msg) (*dns.Msg, string, error) {
 	respCh := make(chan upstreamResponse, len(upstreams))
 
-	// Launch queries concurrently.
+	// Launch queries concurrently
 	for _, ups := range upstreams {
 		go func(u Upstream) {
-			// Check the protocol of the upstream.
 			if u.Protocol == "https" {
-				// Use DNS-over-HTTPS.
+				// DNS-over-HTTPS logic
 				httpClient := &http.Client{Timeout: 5 * time.Second}
 				packed, err := req.Pack()
 				if err != nil {
 					respCh <- upstreamResponse{msg: nil, IsIPv4: u.IsIPv4, Source: u.Address, err: err}
 					return
 				}
-				// Build URL with base64url-encoded DNS query.
 				url := u.Address + "?dns=" + base64.RawURLEncoding.EncodeToString(packed)
 				httpResp, err := httpClient.Get(url)
 				if err != nil {
@@ -168,7 +178,12 @@ func queryUpstreams(req *dns.Msg) (*dns.Msg, string, error) {
 				}
 				defer httpResp.Body.Close()
 				if httpResp.StatusCode != http.StatusOK {
-					respCh <- upstreamResponse{msg: nil, IsIPv4: u.IsIPv4, Source: u.Address, err: fmt.Errorf("non-OK status: %d", httpResp.StatusCode)}
+					respCh <- upstreamResponse{
+						msg:    nil,
+						IsIPv4: u.IsIPv4,
+						Source: u.Address,
+						err:    fmt.Errorf("non-OK status: %d", httpResp.StatusCode),
+					}
 					return
 				}
 				body, err := io.ReadAll(httpResp.Body)
@@ -183,9 +198,9 @@ func queryUpstreams(req *dns.Msg) (*dns.Msg, string, error) {
 				}
 				respCh <- upstreamResponse{msg: &dohMsg, IsIPv4: u.IsIPv4, Source: u.Address, err: nil}
 			} else {
-				// For "udp" or "tcp", use the standard dns.Client.
+				// UDP/TCP
 				client := new(dns.Client)
-				client.Net = u.Protocol // e.g., "udp" or "tcp"
+				client.Net = u.Protocol
 				r, _, err := client.Exchange(req, u.Address)
 				respCh <- upstreamResponse{msg: r, IsIPv4: u.IsIPv4, Source: u.Address, err: err}
 			}
@@ -197,7 +212,7 @@ func queryUpstreams(req *dns.Msg) (*dns.Msg, string, error) {
 	var candidate upstreamResponse
 	foundCandidate := false
 
-	// Wait for the first non-error response.
+	// Wait for the first non-error response
 	for responsesReceived < totalUpstreams {
 		resp := <-respCh
 		responsesReceived++
@@ -218,7 +233,7 @@ func queryUpstreams(req *dns.Msg) (*dns.Msg, string, error) {
 		return candidate.msg, candidate.Source, nil
 	}
 
-	// If the first good reply is IPv6, wait briefly (20ms) for an IPv4 reply.
+	// If first good reply is IPv6, wait briefly for IPv4
 	timer := time.NewTimer(20 * time.Millisecond)
 	defer timer.Stop()
 
@@ -230,24 +245,22 @@ func queryUpstreams(req *dns.Msg) (*dns.Msg, string, error) {
 				continue
 			}
 			if resp.IsIPv4 {
-				// Found an IPv4 answer—prefer it.
+				// Found IPv4—prefer it
 				candidate = resp
 				return candidate.msg, candidate.Source, nil
 			}
 		case <-timer.C:
-			// Timer expired; return the IPv6 answer.
+			// Timer expired; return the IPv6 answer
 			return candidate.msg, candidate.Source, nil
 		}
 	}
 
-	// No more responses available; return what we have.
 	return candidate.msg, candidate.Source, nil
 }
 
 // resolveDNS handles caching, upstream querying, and logging.
-// It returns the DNS response, the source (or "cache" if served from cache), and an error (if any).
 func resolveDNS(remoteAddr string, req *dns.Msg) (*dns.Msg, string, error) {
-	domain := ""
+	var domain string
 	if len(req.Question) > 0 {
 		domain = req.Question[0].Name
 	}
@@ -264,6 +277,7 @@ func resolveDNS(remoteAddr string, req *dns.Msg) (*dns.Msg, string, error) {
 		return cachedMsg, "cache", nil
 	}
 
+	// Not in cache or expired; query upstream
 	resp, fastest, err := queryUpstreams(req)
 	if err != nil {
 		log.Printf("Error resolving %s for %s: %v", domain, remoteAddr, err)
@@ -275,7 +289,9 @@ func resolveDNS(remoteAddr string, req *dns.Msg) (*dns.Msg, string, error) {
 	log.Printf("Responding to query for %s from client %s via upstream %s", domain, remoteAddr, fastest)
 	fileLogger.Printf("Responding to query for %s from client %s via upstream %s", domain, remoteAddr, fastest)
 
+	// Cache the new response
 	setCache(key, resp)
+
 	return resp, fastest, nil
 }
 
@@ -300,7 +316,7 @@ func dohHandler(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		// Expect a "dns" query parameter with a base64url-encoded DNS query.
+		// Expect ?dns= (base64url-encoded)
 		dnsParam := r.URL.Query().Get("dns")
 		if dnsParam == "" {
 			http.Error(w, "missing 'dns' parameter", http.StatusBadRequest)
@@ -316,7 +332,7 @@ func dohHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case http.MethodPost:
-		// The POST body should be the raw DNS query.
+		// POST body should be raw DNS message
 		data, err := io.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, "failed to read request body", http.StatusBadRequest)
@@ -345,7 +361,6 @@ func dohHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set the DoH content type.
 	w.Header().Set("Content-Type", "application/dns-message")
 	_, err = w.Write(packed)
 	if err != nil {
@@ -359,14 +374,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to open log file: %v", err)
 	}
-	// Create a file logger that writes to f.
 	fileLogger = log.New(f, "", log.LstdFlags)
-	// f will remain open for the lifetime of the server.
 
-	// Set up the DNS handler (for both UDP and TCP).
+	// Set up the DNS handler (UDP and TCP).
 	dns.HandleFunc(".", handleDNSRequest)
 
-	// Start the DNS server on UDP.
+	// Start DNS on UDP
 	udpServer := &dns.Server{
 		Addr:    ":53",
 		Net:     "udp",
@@ -379,7 +392,7 @@ func main() {
 		}
 	}()
 
-	// Start the DNS server on TCP.
+	// Start DNS on TCP
 	tcpServer := &dns.Server{
 		Addr:    ":53",
 		Net:     "tcp",
@@ -392,7 +405,7 @@ func main() {
 		}
 	}()
 
-	// Set up the HTTP endpoint for DNS-over-HTTPS.
+	// Start HTTP (DoH) on :8080
 	http.HandleFunc("/dns-query", dohHandler)
 	go func() {
 		httpAddr := ":8080"
