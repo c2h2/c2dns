@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -11,9 +12,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/miekg/dns"
@@ -28,6 +31,15 @@ var globalReqCount uint64
 var globalFailedCount uint64
 var globalCacheHits uint64
 var globalDeniedAAAA uint64
+
+// persistentCacheEntry is the structure we use to save the cache to disk.
+type persistentCacheEntry struct {
+	Key         string `json:"key"`
+	Msg         string `json:"msg"` // base64 encoded dns message bytes
+	Expires     int64  `json:"expires"`
+	OriginalTTL uint32 `json:"original_ttl"`
+	Created     int64  `json:"created"`
+}
 
 // upstreamResult holds the result from an upstream query.
 type upstreamResult struct {
@@ -92,6 +104,9 @@ var chinaList map[string]bool
 
 // Enforce a minimum TTL so zero/low TTLs from upstream won't disable caching.
 const defaultMinTTL = 30
+
+// Name of the file used for persistent cache.
+const cacheFile = "cache_db.json"
 
 // ANSI color codes
 const (
@@ -589,13 +604,81 @@ func printCacheStats() {
 		}
 		failed := atomic.LoadUint64(&globalFailedCount)
 		deniedAAAA := atomic.LoadUint64(&globalDeniedAAAA)
-		
+
 		banner := fmt.Sprintf("==========Cache Stats | Uptime: %s==========", uptimeStr)
 		fmt.Println(banner)
 		fmt.Printf("%sTotal Cache Entries=%d, Valid=%d, Expired=%d, Failed=%d, DeniedAAAA=%d%s\n", colorGreen, total, valid, expired, failed, deniedAAAA, colorReset)
-		fmt.Printf("%sTotal DNS Requests=%d, ReqPerSec=%.2f, Cache Hit Rate=%.2f%%, Cache Miss Rate=%.2f%%%s\n", colorGreen, requests, requestsPerSecond, cacheHitRate, 100 - cacheHitRate, colorReset)
+		fmt.Printf("%sTotal DNS Requests=%d, ReqPerSec=%.2f, Cache Hit Rate=%.2f%%, Cache Miss Rate=%.2f%%%s\n", colorGreen, requests, requestsPerSecond, cacheHitRate, 100-cacheHitRate, colorReset)
 		fmt.Println(strings.Repeat("=", len(banner)))
 	}
+}
+
+// saveCacheToDisk writes the current cache to a file (in JSON format).
+func saveCacheToDisk(filename string) error {
+	cacheMutex.RLock()
+	defer cacheMutex.RUnlock()
+
+	var entries []persistentCacheEntry
+	for key, entry := range cache {
+		packed, err := entry.msg.Pack()
+		if err != nil {
+			log.Printf("Failed to pack dns msg for key %s: %v", key, err)
+			continue
+		}
+		encodedMsg := base64.StdEncoding.EncodeToString(packed)
+		entries = append(entries, persistentCacheEntry{
+			Key:         key,
+			Msg:         encodedMsg,
+			Expires:     entry.expires.Unix(),
+			OriginalTTL: entry.originalTTL,
+			Created:     entry.created.Unix(),
+		})
+	}
+	data, err := json.Marshal(entries)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filename, data, 0644)
+}
+
+// loadCacheFromDisk loads the cache from the given file.
+func loadCacheFromDisk(filename string) error {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return err
+	}
+	var entries []persistentCacheEntry
+	err = json.Unmarshal(data, &entries)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	cacheMutex.Lock()
+	defer cacheMutex.Unlock()
+	for _, entry := range entries {
+		if now.Unix() > entry.Expires {
+			// Skip expired entries.
+			continue
+		}
+		packed, err := base64.StdEncoding.DecodeString(entry.Msg)
+		if err != nil {
+			log.Printf("Failed to decode msg for key %s: %v", entry.Key, err)
+			continue
+		}
+		var msg dns.Msg
+		err = msg.Unpack(packed)
+		if err != nil {
+			log.Printf("Failed to unpack dns msg for key %s: %v", entry.Key, err)
+			continue
+		}
+		cache[entry.Key] = cacheEntry{
+			msg:         &msg,
+			expires:     time.Unix(entry.Expires, 0),
+			originalTTL: entry.OriginalTTL,
+			created:     time.Unix(entry.Created, 0),
+		}
+	}
+	return nil
 }
 
 func main() {
@@ -623,12 +706,36 @@ func main() {
 		log.Printf("Loaded %d entries from %s", len(chinaList), *chinaListFile)
 	}
 
+	// Attempt to load the persistent cache.
+	if _, err := os.Stat(cacheFile); err == nil {
+		err = loadCacheFromDisk(cacheFile)
+		if err != nil {
+			log.Printf("Failed to load cache: %v", err)
+		} else {
+			log.Println("Cache loaded successfully.")
+		}
+	}
+
 	// Open (or create) a log file.
 	f, err := os.OpenFile("dns_queries.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Fatalf("Failed to open log file: %v", err)
 	}
 	fileLogger = log.New(f, "", log.LstdFlags)
+
+	// Set up a signal handler to save the cache on shutdown.
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		log.Println("Received shutdown signal, saving cache...")
+		if err := saveCacheToDisk(cacheFile); err != nil {
+			log.Printf("Failed to save cache: %v", err)
+		} else {
+			log.Println("Cache saved successfully.")
+		}
+		os.Exit(0)
+	}()
 
 	go printCacheStats()
 
