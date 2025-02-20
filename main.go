@@ -25,6 +25,7 @@ import (
 
 var EXPIRE_MULTIPLIER int
 var requestGroup singleflight.Group
+var upstreamTimeoutSeconds = time.Duration(3) * time.Second
 
 // Global counters.
 var globalReqCount uint64
@@ -68,13 +69,13 @@ var upstreamsChina = []Upstream{
 
 // upstreamsDefault is used for other domains.
 var upstreamsDefault = []Upstream{
-	{Address: "1.1.1.1:53", IsIPv4: true, Protocol: "udp"},
 	{Address: "8.8.8.8:53", IsIPv4: true, Protocol: "udp"},
 	{Address: "8.8.4.4:53", IsIPv4: true, Protocol: "udp"},
 	{Address: "9.9.9.9:53", IsIPv4: true, Protocol: "udp"},
+	{Address: "1.1.1.1:53", IsIPv4: true, Protocol: "udp"},
 	// DNS-over-HTTPS example:
-	{Address: "https://1.1.1.1/dns-query", IsIPv4: true, Protocol: "https"},
-	{Address: "https://8.8.8.8/dns-query", IsIPv4: true, Protocol: "https"},
+	/*{Address: "https://1.1.1.1/dns-query", IsIPv4: true, Protocol: "https"},
+	{Address: "https://8.8.8.8/dns-query", IsIPv4: true, Protocol: "https"},*/
 }
 
 // upstreamResponse carries the result of one upstream query.
@@ -220,7 +221,7 @@ func queryUpstreams(req *dns.Msg, ups []Upstream) (*dns.Msg, string, error) {
 		go func(u Upstream) {
 			if u.Protocol == "https" {
 				// DNS-over-HTTPS logic.
-				httpClient := &http.Client{Timeout: 5 * time.Second}
+				httpClient := &http.Client{Timeout: upstreamTimeoutSeconds * time.Second}
 				packed, err := req.Pack()
 				if err != nil {
 					respCh <- upstreamResponse{msg: nil, IsIPv4: u.IsIPv4, Source: u.Address, err: err}
@@ -268,26 +269,32 @@ func queryUpstreams(req *dns.Msg, ups []Upstream) (*dns.Msg, string, error) {
 	var candidate upstreamResponse
 	foundCandidate := false
 
+	// Overall timeout for upstream responses.
+	overallTimeout := time.NewTimer(upstreamTimeoutSeconds * time.Second)
+	defer overallTimeout.Stop()
+
 	// Wait for the first successful response.
 	for responsesReceived < total {
-		resp := <-respCh
-		responsesReceived++
-		if resp.err != nil || resp.msg == nil {
-			continue
+		select {
+		case resp := <-respCh:
+			responsesReceived++
+			if resp.err != nil || resp.msg == nil {
+				continue
+			}
+			candidate = resp
+			foundCandidate = true
+			break
+		case <-overallTimeout.C:
+			return nil, "", errors.New("upstream query timed out")
 		}
-		candidate = resp
-		foundCandidate = true
-		break
+		if foundCandidate {
+			break
+		}
 	}
 
 	if !foundCandidate {
-		// Wait for all upstreams to finish.
-		for range ups {
-			<-respCh
-		}
-		if !foundCandidate {
-			return nil, "", errors.New("all upstream queries failed")
-		}
+		// In case no successful response was received.
+		return nil, "", errors.New("all upstream queries failed")
 	}
 
 	// If the first successful response is IPv4, return it immediately.
@@ -398,7 +405,7 @@ func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start t
 		domain = req.Question[0].Name
 	}
 	// Build a log line.
-	logLine := fmt.Sprintf("reqID=%d, remote=%s, domain=%s", reqID, remoteAddr, domain)
+	logLine := fmt.Sprintf("[%d], remote=%s, domain=%s", reqID, remoteAddr, domain)
 
 	key := cacheKey(req)
 	// Check cache.
@@ -410,6 +417,7 @@ func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start t
 		elapsed := time.Since(start)
 		ms := float64(elapsed.Nanoseconds()) / 1e6
 		logLine += fmt.Sprintf(", from=%s, time=%.3fms", protocol, ms)
+		logLine = "HIT: " + logLine
 		fmt.Printf("%s%s%s\n", colorGreen, logLine, colorReset)
 		fileLogger.Println(logLine)
 		return cachedMsg, "cache", nil
@@ -421,11 +429,13 @@ func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start t
 	if isChinaDomain(domain) {
 		selectedUpstreams = upstreamsChina
 		logLine += ", upstream=china"
+		logLine = "CHN: " + logLine
 		color = colorBlue
 		atomic.AddUint64(&globalChinaDomainsCount, 1)
 	} else {
 		selectedUpstreams = upstreamsDefault
 		logLine += ", upstream=default"
+		logLine = "DFT: " + logLine
 		color = colorYellow
 		atomic.AddUint64(&globalDefaultDomainsDNSCount, 1)
 	}
@@ -443,6 +453,7 @@ func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start t
 	})
 
 	if err != nil {
+		logLine = "FAILED: " + logLine
 		logLine += fmt.Sprintf(", error=%v", err)
 		elapsed := time.Since(start)
 		ms := float64(elapsed.Nanoseconds()) / 1e6
@@ -462,39 +473,47 @@ func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start t
 	return result.msg, result.fastest, nil
 }
 
-// filterAAAAIfAExists checks for an A record for the queried domain and, if found,
-// removes any AAAA records from the response.
+// filterAAAAIfAExists checks for an A record for the queried domain and,
+// if found, returns an NXDOMAIN response (empty AAAA answer) with a root SOA.
 func filterAAAAIfAExists(resp *dns.Msg, req *dns.Msg, remoteAddr, proto string, reqID uint64, start time.Time) *dns.Msg {
 	if len(req.Question) == 0 || req.Question[0].Qtype != dns.TypeAAAA || !denyAAAA {
 		return resp
 	}
+	var emptyResp = true
 
-	aReq := new(dns.Msg)
-	aReq.SetQuestion(req.Question[0].Name, dns.TypeA)
-	newReqID := atomic.AddUint64(&globalReqCount, 1)
-	aResp, _, err := resolveDNS(remoteAddr, proto, aReq, newReqID, start)
-	if err == nil && len(aResp.Answer) > 0 {
-		atomic.AddUint64(&globalDeniedAAAA, 1)
-		logLine := fmt.Sprintf("reqID=%d, domain=%s: AAAA response denied because A record exists", reqID, req.Question[0].Name)
-		fileLogger.Println(logLine)
+	if emptyResp {
+		resp.Answer = nil
+		resp.Extra = nil
+		return resp
+	}else{
+		aReq := new(dns.Msg)
+		aReq.SetQuestion(req.Question[0].Name, dns.TypeA)
+		newReqID := atomic.AddUint64(&globalReqCount, 1)
+		aResp, _, err := resolveDNS(remoteAddr, proto, aReq, newReqID, start)
+		if err == nil && len(aResp.Answer) > 0 {
+			atomic.AddUint64(&globalDeniedAAAA, 1)
+			logLine := fmt.Sprintf("[%d] domain=%s: Returning NXDOMAIN for AAAA query because A record exists", reqID, req.Question[0].Name)
+			fileLogger.Println(logLine)
+			log.Printf(logLine)
 
-		var filteredAnswers []dns.RR
-		for _, rr := range resp.Answer {
-			if rr.Header().Rrtype != dns.TypeAAAA {
-				filteredAnswers = append(filteredAnswers, rr)
+			// Build a new response message with NXDOMAIN (RcodeNameError)
+			m := new(dns.Msg)
+			m.SetRcode(req, dns.RcodeNameError)
+			// Add a static root SOA record in the authority section.
+			soa, err := dns.NewRR(". 86399 IN SOA a.root-servers.net. nstld.verisign-grs.com. 2025021902 1800 900 604800 86400")
+			if err == nil {
+				m.Ns = []dns.RR{soa}
 			}
+			// Optionally, add an OPT record for EDNS0.
+			opt := new(dns.OPT)
+			opt.Hdr.Name = "."
+			opt.Hdr.Rrtype = dns.TypeOPT
+			opt.SetUDPSize(4096)
+			m.Extra = []dns.RR{opt}
+			return m
 		}
-		resp.Answer = filteredAnswers
-
-		var filteredExtra []dns.RR
-		for _, rr := range resp.Extra {
-			if rr.Header().Rrtype != dns.TypeAAAA {
-				filteredExtra = append(filteredExtra, rr)
-			}
-		}
-		resp.Extra = filteredExtra
+		return resp
 	}
-	return resp
 }
 
 // handleDNSRequest is the handler for DNS queries (UDP/TCP).
