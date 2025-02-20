@@ -88,7 +88,7 @@ func processDomain(domain string) DomainResult {
 	res.Domain = domain
 
 	// Query authority server.
-	authServer := "223.5.5.5:53"
+	authServer := "8.8.8.8:53"
 	authResp, authLatency, err := queryARecordWithRetry(domain, authServer, maxRetries)
 	res.AuthLatency = authLatency
 	if err != nil {
