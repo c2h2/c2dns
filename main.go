@@ -69,13 +69,14 @@ var upstreamsChina = []Upstream{
 
 // upstreamsDefault is used for other domains.
 var upstreamsDefault = []Upstream{
-	{Address: "8.8.8.8:53", IsIPv4: true, Protocol: "udp"},
-	{Address: "8.8.4.4:53", IsIPv4: true, Protocol: "udp"},
-	{Address: "9.9.9.9:53", IsIPv4: true, Protocol: "udp"},
-	{Address: "1.1.1.1:53", IsIPv4: true, Protocol: "udp"},
+	/*{Address: "8.8.8.8:53", IsIPv4: true, Protocol: "tcp"},
+	{Address: "8.8.4.4:53", IsIPv4: true, Protocol: "tcp"},
+	{Address: "1.1.1.1:53", IsIPv4: true, Protocol: "tcp"},
+	/*{Address: "9.9.9.9:53", IsIPv4: true, Protocol: "udp"},*/
+	
 	// DNS-over-HTTPS example:
-	/*{Address: "https://1.1.1.1/dns-query", IsIPv4: true, Protocol: "https"},
-	{Address: "https://8.8.8.8/dns-query", IsIPv4: true, Protocol: "https"},*/
+	{Address: "https://1.1.1.1/dns-query", IsIPv4: true, Protocol: "https"},
+	{Address: "https://8.8.8.8/dns-query", IsIPv4: true, Protocol: "https"},
 }
 
 // upstreamResponse carries the result of one upstream query.
