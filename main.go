@@ -68,6 +68,7 @@ type Config struct {
 	SocksServers    []string  `json:"socks_servers"`
 	UpstreamsChina  []Upstream `json:"upstreams_china"`
 	UpstreamsDefault []Upstream `json:"upstreams_default"`
+	ChinaListFilterKeywords []string `json:"china_list_filter_keywords"`
 }
 
 // Global configuration variables.
@@ -75,6 +76,7 @@ var (
 	socksServers    []string
 	upstreamsChina  []Upstream
 	upstreamsDefault []Upstream
+	chinaListFilterKeywords []string
 )
 
 // upstreamResponse carries the result of one upstream query.
@@ -378,7 +380,8 @@ func isChinaDomain(domain string) bool {
 // loadChinaList reads domains from the specified file (or URL) into a map.
 func loadChinaList(filename string) (map[string]bool, error) {
 	var reader io.Reader
-
+	//filter the filename by the china_list_filter_keywords
+	
 	if strings.HasPrefix(filename, "http") {
 		// Download from URL.
 		log.Printf("Downloading China list from %s", filename)
@@ -397,7 +400,8 @@ func loadChinaList(filename string) (map[string]bool, error) {
 		defer f.Close()
 		reader = f
 	}
-
+	log.Printf("Chinalist filter number of words %d", len(chinaListFilterKeywords))
+	var filteredCount int
 	m := make(map[string]bool)
 	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
@@ -408,7 +412,15 @@ func loadChinaList(filename string) (map[string]bool, error) {
 		// Normalize the domain: lower-case and remove trailing dot.
 		domain := strings.TrimSuffix(strings.ToLower(line), ".")
 		m[domain] = true
+		for _, keyword := range chinaListFilterKeywords {
+			if strings.Contains(domain, keyword) {
+				delete(m, domain)
+				filteredCount++
+				break
+			}
+		}
 	}
+	log.Printf("Filtered out Chinalist domains: %d", filteredCount)
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
@@ -808,8 +820,17 @@ func main() {
 	denyAAAA = *denyAAAAFlag
 	EXPIRE_MULTIPLIER = *expireMultiplierFlag
 
+	// Load the configuration.
+	cfg, err := loadConfig(*configFile)
+	if err != nil {
+		log.Fatalf("Failed to load config from %s: %v", *configFile, err)
+	}
+	socksServers = cfg.SocksServers
+	upstreamsChina = cfg.UpstreamsChina
+	upstreamsDefault = cfg.UpstreamsDefault
+	chinaListFilterKeywords = cfg.ChinaListFilterKeywords
+
 	// Load the China list.
-	var err error
 	chinaList, err = loadChinaList(*chinaListFile)
 	if err != nil {
 		// Attempt to download from an alternative URL.
@@ -823,16 +844,7 @@ func main() {
 	} else {
 		log.Printf("Loaded %d entries from %s", len(chinaList), *chinaListFile)
 	}
-
-	// Load the configuration.
-	cfg, err := loadConfig(*configFile)
-	if err != nil {
-		log.Fatalf("Failed to load config from %s: %v", *configFile, err)
-	}
-	socksServers = cfg.SocksServers
-	upstreamsChina = cfg.UpstreamsChina
-	upstreamsDefault = cfg.UpstreamsDefault
-
+	
 	// Attempt to load the persistent cache.
 	if _, err := os.Stat(cacheFile); err == nil {
 		err = loadCacheFromDisk(cacheFile)

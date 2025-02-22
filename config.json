@@ -1,7 +1,7 @@
 {
 	"socks_servers": [
 	  "127.0.0.1:1080",
-	  "172.0.0.1:1080"
+	  "127.0.0.1:1081"
 	],
 	"upstreams_china": [
 	  { "address": "223.5.5.5:53", "is_ipv4": true, "protocol": "udp" },
@@ -10,5 +10,13 @@
 	"upstreams_default": [
 	  { "address": "https://1.1.1.1/dns-query", "is_ipv4": true, "protocol": "https" },
 	  { "address": "https://8.8.8.8/dns-query", "is_ipv4": true, "protocol": "https" }
+	],
+	"china_list_filter_keywords": [
+	  "google",
+	  "facebook",
+	  "twitter",
+	  "instagram",
+	  "gstatic",
+	  "instagram"
 	]
   }  
