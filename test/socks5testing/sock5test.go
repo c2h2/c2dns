@@ -6,14 +6,45 @@ import (
 	"log"
 	"net/http"
 	"time"
-
+	"os"
+	"encoding/json"
 	"golang.org/x/net/proxy"
 )
 
+type Config struct {
+	SocksServers    []string  `json:"socks_servers"`
+}
+
+// loadConfig reads the configuration from the specified JSON file.
+func loadConfig(filename string) (*Config, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, err
+	}
+	var cfg Config
+	err = json.Unmarshal(data, &cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+
 func main() {
 	// SOCKS5 proxy address (replace with your proxy)
-	socks5Proxy := "localhost:1080"
+	
+	cfg, err := loadConfig("../../config.json")
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+	for _, socks5Proxy := range cfg.SocksServers {
+		doTest(socks5Proxy)
+	}
+}
 
+func doTest(socks5Proxy string) {
+	log.Printf("Testing with Socks = %s", socks5Proxy)
+		
 	// Target HTTPS URL
 	url := "https://ifconfig.me"
 
