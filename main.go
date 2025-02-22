@@ -18,9 +18,11 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-
+	"crypto/tls"
+	"math/rand"
 	"github.com/miekg/dns"
 	"golang.org/x/sync/singleflight"
+	"golang.org/x/net/proxy"
 )
 
 var EXPIRE_MULTIPLIER int
@@ -59,6 +61,12 @@ type Upstream struct {
 	Address  string // For UDP/TCP: host:port; For HTTPS: full URL (e.g. "https://1.1.1.1/dns-query")
 	IsIPv4   bool   // whether this upstream is IPv4
 	Protocol string // "udp", "tcp", or "https"
+}
+
+// socksServers is a list of SOCKS5 servers to use for DNS-over-HTTPS requests.
+var socksServers = []string{
+	"172.16.10.1:1081",
+	"172.16.10.1:1081",
 }
 
 // upstreamsChina is used for domains in the China list.
@@ -213,42 +221,79 @@ func setCache(key string, msg *dns.Msg) {
 	cacheMutex.Unlock()
 }
 
+// httpRequestWithSockServers makes an HTTP GET request to the provided URL,
+// ignoring TLS certificate verification. If httpsUseSocks is true, it routes the request
+// through a SOCKS5 proxy. It returns the response body as a byte slice.
+func httpRequestWithSockServers(url string, httpsUseSocks bool) ([]byte, error) {
+	var client *http.Client
+
+	if httpsUseSocks {
+		// Define the SOCKS5 proxy address.
+		//socksAddr := "127.0.0.1:1080" // Update this with your SOCKS proxy address if needed.
+		//random select socks server
+		socksAddr := socksServers[rand.Intn(len(socksServers))]
+
+		// Create a SOCKS5 dialer.
+		dialer, err := proxy.SOCKS5("tcp", socksAddr, nil, proxy.Direct)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create SOCKS5 dialer: %w", err)
+		}
+
+		// Set up a transport that uses the SOCKS5 dialer and ignores certificate checks.
+		transport := &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			Dial:            dialer.Dial,
+		}
+
+		client = &http.Client{
+			Timeout:   10 * time.Second,
+			Transport: transport,
+		}
+	} else {
+		// Set up a transport that ignores certificate checks.
+		transport := &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+
+		client = &http.Client{
+			Timeout:   10 * time.Second,
+			Transport: transport,
+		}
+	}
+
+	// Perform the GET request.
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to make GET request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Check for a non-OK HTTP status.
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("non-OK HTTP status: %s", resp.Status)
+	}
+
+	// Read the response body.
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	return body, nil
+}
+
+
 // queryUpstreams sends the DNS query concurrently to the provided upstream servers and returns the fastest reply.
 func queryUpstreams(req *dns.Msg, ups []Upstream) (*dns.Msg, string, error) {
 	respCh := make(chan upstreamResponse, len(ups))
-
+	httpsUseSocks := true
 	// Launch queries concurrently.
 	for _, u := range ups {
 		go func(u Upstream) {
-			if u.Protocol == "https" {
-				// DNS-over-HTTPS logic.
-				httpClient := &http.Client{Timeout: upstreamTimeoutSeconds * time.Second}
+			if u.Protocol == "https" { // DNS-over-HTTPS.
 				packed, err := req.Pack()
-				if err != nil {
-					respCh <- upstreamResponse{msg: nil, IsIPv4: u.IsIPv4, Source: u.Address, err: err}
-					return
-				}
 				url := u.Address + "?dns=" + base64.RawURLEncoding.EncodeToString(packed)
-				httpResp, err := httpClient.Get(url)
-				if err != nil {
-					respCh <- upstreamResponse{msg: nil, IsIPv4: u.IsIPv4, Source: u.Address, err: err}
-					return
-				}
-				defer httpResp.Body.Close()
-				if httpResp.StatusCode != http.StatusOK {
-					respCh <- upstreamResponse{
-						msg:    nil,
-						IsIPv4: u.IsIPv4,
-						Source: u.Address,
-						err:    fmt.Errorf("non-OK status: %d", httpResp.StatusCode),
-					}
-					return
-				}
-				body, err := io.ReadAll(httpResp.Body)
-				if err != nil {
-					respCh <- upstreamResponse{msg: nil, IsIPv4: u.IsIPv4, Source: u.Address, err: err}
-					return
-				}
+				body, err := httpRequestWithSockServers(url, httpsUseSocks)
 				var dohMsg dns.Msg
 				if err = dohMsg.Unpack(body); err != nil {
 					respCh <- upstreamResponse{msg: nil, IsIPv4: u.IsIPv4, Source: u.Address, err: err}
@@ -265,7 +310,7 @@ func queryUpstreams(req *dns.Msg, ups []Upstream) (*dns.Msg, string, error) {
 		}(u)
 	}
 
-	total := len(ups)
+	totalUpstreams := len(ups)
 	responsesReceived := 0
 	var candidate upstreamResponse
 	foundCandidate := false
@@ -275,7 +320,7 @@ func queryUpstreams(req *dns.Msg, ups []Upstream) (*dns.Msg, string, error) {
 	defer overallTimeout.Stop()
 
 	// Wait for the first successful response.
-	for responsesReceived < total {
+	for responsesReceived < totalUpstreams {
 		select {
 		case resp := <-respCh:
 			responsesReceived++
@@ -307,7 +352,7 @@ func queryUpstreams(req *dns.Msg, ups []Upstream) (*dns.Msg, string, error) {
 	timer := time.NewTimer(20 * time.Millisecond)
 	defer timer.Stop()
 
-	for responsesReceived < total {
+	for responsesReceived < totalUpstreams {
 		select {
 		case resp := <-respCh:
 			responsesReceived++
