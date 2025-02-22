@@ -63,29 +63,19 @@ type Upstream struct {
 	Protocol string // "udp", "tcp", or "https"
 }
 
-// socksServers is a list of SOCKS5 servers to use for DNS-over-HTTPS requests.
-var socksServers = []string{
-	"172.16.10.1:1081",
-	"172.16.10.1:1081",
+// Config holds our custom configuration loaded from JSON.
+type Config struct {
+	SocksServers    []string  `json:"socks_servers"`
+	UpstreamsChina  []Upstream `json:"upstreams_china"`
+	UpstreamsDefault []Upstream `json:"upstreams_default"`
 }
 
-// upstreamsChina is used for domains in the China list.
-var upstreamsChina = []Upstream{
-	{Address: "223.5.5.5:53", IsIPv4: true, Protocol: "udp"},
-	{Address: "223.6.6.6:53", IsIPv4: true, Protocol: "udp"},
-}
-
-// upstreamsDefault is used for other domains.
-var upstreamsDefault = []Upstream{
-	/*{Address: "8.8.8.8:53", IsIPv4: true, Protocol: "tcp"},
-	{Address: "8.8.4.4:53", IsIPv4: true, Protocol: "tcp"},
-	{Address: "1.1.1.1:53", IsIPv4: true, Protocol: "tcp"},
-	/*{Address: "9.9.9.9:53", IsIPv4: true, Protocol: "udp"},*/
-	
-	// DNS-over-HTTPS example:
-	{Address: "https://1.1.1.1/dns-query", IsIPv4: true, Protocol: "https"},
-	{Address: "https://8.8.8.8/dns-query", IsIPv4: true, Protocol: "https"},
-}
+// Global configuration variables.
+var (
+	socksServers    []string
+	upstreamsChina  []Upstream
+	upstreamsDefault []Upstream
+)
 
 // upstreamResponse carries the result of one upstream query.
 type upstreamResponse struct {
@@ -793,11 +783,27 @@ func loadCacheFromDisk(filename string) error {
 	return nil
 }
 
+// loadConfig reads the configuration from the specified JSON file.
+func loadConfig(filename string) (*Config, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, err
+	}
+	var cfg Config
+	err = json.Unmarshal(data, &cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
 func main() {
-	log.Println("\033[32m" + "Welcome to c2dns" + "\033[0m")
+	//print date and welcome message
+	log.Println("\033[32m" + time.Now().Format("2006-01-02 15:04:05") + " Welcome to c2dns" + "\033[0m")
 	denyAAAAFlag := flag.Bool("denyAAAA", true, "Deny IPv6 AAAA records if an A record exists")
 	expireMultiplierFlag := flag.Int("expireMultiplier", 10, "Multiplier for the cache expiration time")
 	chinaListFile := flag.String("chinaList", "chinalist.txt", "Path to the China list file")
+	configFile := flag.String("config", "config.json", "Path to the configuration JSON file")
 	flag.Parse()
 	denyAAAA = *denyAAAAFlag
 	EXPIRE_MULTIPLIER = *expireMultiplierFlag
@@ -817,6 +823,15 @@ func main() {
 	} else {
 		log.Printf("Loaded %d entries from %s", len(chinaList), *chinaListFile)
 	}
+
+	// Load the configuration.
+	cfg, err := loadConfig(*configFile)
+	if err != nil {
+		log.Fatalf("Failed to load config from %s: %v", *configFile, err)
+	}
+	socksServers = cfg.SocksServers
+	upstreamsChina = cfg.UpstreamsChina
+	upstreamsDefault = cfg.UpstreamsDefault
 
 	// Attempt to load the persistent cache.
 	if _, err := os.Stat(cacheFile); err == nil {
