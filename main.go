@@ -28,6 +28,7 @@ import (
 var EXPIRE_MULTIPLIER int
 var requestGroup singleflight.Group
 var upstreamTimeoutSeconds = time.Duration(3) * time.Second
+const HTTPS_TIMEOUT_SECONDS = 10 * time.Second
 
 // Global counters.
 var globalReqCount uint64
@@ -238,7 +239,7 @@ func httpRequestWithSockServers(url string, httpsUseSocks bool) ([]byte, error) 
 		}
 
 		client = &http.Client{
-			Timeout:   10 * time.Second,
+			Timeout:   HTTPS_TIMEOUT_SECONDS,
 			Transport: transport,
 		}
 	} else {
@@ -448,6 +449,8 @@ func recordRRCounts(msg *dns.Msg) {
 // resolveDNS handles caching, upstream querying, and logging. It selects the upstream servers
 // based on whether the queried domain (or its parent) is in the China list.
 func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start time.Time) (*dns.Msg, string, error) {
+	var resolveIP string
+	var queryType string
 	domain := ""
 	if len(req.Question) > 0 {
 		domain = req.Question[0].Name
@@ -464,8 +467,18 @@ func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start t
 		logLine += ", served=cache"
 		elapsed := time.Since(start)
 		ms := float64(elapsed.Nanoseconds()) / 1e6
-		logLine += fmt.Sprintf(", from=%s, time=%.3fms", protocol, ms)
+		if len(cachedMsg.Answer) > 0 {
+			queryType = dns.TypeToString[cachedMsg.Answer[0].Header().Rrtype]
+		}else{
+			queryType = "NONE"
+		}
 		logLine = "HIT: " + logLine
+		if queryType == "A" {
+			resolveIP = cachedMsg.Answer[0].(*dns.A).A.String()
+			logLine += fmt.Sprintf(", QType=%s, from=%s, time=%.1fms, ip=%s", queryType, protocol, ms, resolveIP)
+		}else{
+			logLine += fmt.Sprintf(", QType=%s, from=%s, time=%.1fms", queryType, protocol, ms)
+		}
 		fmt.Printf("%s%s%s\n", colorGreen, logLine, colorReset)
 		fileLogger.Println(logLine)
 		return cachedMsg, "cache", nil
@@ -505,7 +518,8 @@ func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start t
 		logLine += fmt.Sprintf(", error=%v", err)
 		elapsed := time.Since(start)
 		ms := float64(elapsed.Nanoseconds()) / 1e6
-		logLine += fmt.Sprintf(", proto=%s, time=%.3fms", protocol, ms)
+		resolveIP = "FAILED"
+		logLine += fmt.Sprintf(", proto=%s, time=%.1fms, ip=%s", protocol, ms, resolveIP)
 		fmt.Printf("%s%s%s\n", colorRed, logLine, colorReset)
 		fileLogger.Println(logLine)
 		atomic.AddUint64(&globalFailedCount, 1)
@@ -515,7 +529,17 @@ func resolveDNS(remoteAddr, protocol string, req *dns.Msg, reqID uint64, start t
 	result := v.(upstreamResult)
 	elapsed := time.Since(start)
 	ms := float64(elapsed.Nanoseconds()) / 1e6
-	logLine += fmt.Sprintf(", served=upstream:%s, proto=%s, time=%.3fms", result.fastest, protocol, ms)
+	if len(result.msg.Answer) > 0 {
+		queryType := dns.TypeToString[result.msg.Answer[0].Header().Rrtype]
+		if queryType == "A" {
+			resolveIP = result.msg.Answer[0].(*dns.A).A.String()
+		}else{
+			resolveIP = ""
+		}
+		logLine += fmt.Sprintf(", served=upstream:%s, QType=%s, proto=%s, time=%.1fms, ip=%s", result.fastest, queryType, protocol, ms, resolveIP)
+	}else{
+		logLine += fmt.Sprintf(", served=upstream:%s, proto=%s, time=%.1fms", result.fastest, protocol, ms)
+	}
 	fmt.Printf("%s%s%s\n", color, logLine, colorReset)
 	fileLogger.Println(logLine)
 	return result.msg, result.fastest, nil
@@ -593,10 +617,10 @@ func handleDNSRequest(w dns.ResponseWriter, req *dns.Msg) {
 		resp = filterAAAAIfAExists(resp, req, remoteAddr, proto, reqID, start)
 	}
 
+	_ = w.WriteMsg(resp)
+
 	// Record the DNS record counts from this response.
 	recordRRCounts(resp)
-
-	_ = w.WriteMsg(resp)
 }
 
 // dohHandler implements a simple DNS-over-HTTPS (DoH) endpoint.
